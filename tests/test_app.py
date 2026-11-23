@@ -239,6 +239,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("/admin/", response.get_json()["error"])
 
+    def test_legacy_login_endpoints_stay_json(self):
+        """旧 WebView 缓存的 app.js 还会打这两个接口：必须回 JSON，不能回 404 HTML。"""
+        response = self.client.post("/api/login", json={"username": "a", "password": "b"})
+        self.assertEqual(response.status_code, 410)
+        self.assertTrue(response.is_json)
+        self.assertIn("/forest/login", response.get_json()["login_url"])
+        users = self.client.get("/admin/api/users")
+        self.assertEqual(users.status_code, 410)
+        self.assertTrue(users.is_json)
+
     def test_project_uses_original_filename(self):
         response = self.client.get("/api/projects")
         self.assertEqual(response.get_json()["projects"][0]["filename"], SAMPLE.name)
@@ -395,6 +405,16 @@ class GatewayMountTests(unittest.TestCase):
         me = self.client.get("/api/me", environ_overrides={"SCRIPT_NAME": "/exp-survey"}).get_json()
         self.assertEqual(me["user"], "admin")
         self.assertEqual(me["login_url"], "/forest/login?next=/exp-survey/")
+
+    def test_assets_are_versioned_for_webview_cache(self):
+        with self.client.session_transaction() as session:
+            session["user_id"] = 1
+        html = self.client.get("/", environ_overrides={"SCRIPT_NAME": "/exp-survey"}).get_data(as_text=True)
+        self.assertIn("/exp-survey/static/app.js?v=", html)
+        self.assertNotIn('app.js"', html)   # 不能再有无版本号的引用
+        js = self.client.get("/static/app.js?v=v1.2.1")
+        self.assertEqual(js.headers["Cache-Control"], "public, max-age=604800")
+        js.close()   # 释放静态文件句柄，避免 ResourceWarning 噪音
 
 
 if __name__ == "__main__":

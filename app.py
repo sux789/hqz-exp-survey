@@ -85,6 +85,11 @@ MIGRATIONS = (
     ("projects", "is_active", "INTEGER NOT NULL DEFAULT 1"),
 )
 
+# 静态资源版本：每次发版递增，模板把它拼到 ?v= 上。
+# 原因：Capacitor WebView 会把 app.js 缓存到本地，HTML 改了但 JS 还是旧的 →
+# 旧页面继续 POST 已删除的 /api/login，拿到 404 HTML 就报 "is not valid JSON"。
+ASSET_VERSION = "v1.2.1"
+
 
 def parse_blob(filename, blob):
     """内存解析：dry 预览不落盘、不产生垃圾文件。"""
@@ -268,14 +273,14 @@ def create_app(prefix="", test_config=None):
     @bp.get("/")
     @auth.login_required
     def index():
-        return render_template("index.html", base=prefix)
+        return render_template("index.html", base=prefix, asset_version=ASSET_VERSION)
 
     @bp.get("/admin/")
     @auth.admin_required
     def admin_page():
         user = auth.current_user()
         return render_template("admin.html", base=prefix, user=user["username"],
-                               is_admin=auth.is_admin(user))
+                               is_admin=auth.is_admin(user), asset_version=ASSET_VERSION)
 
     # ── 认证（登录/改密都在 forest-data，这里只读登录态）──────
     @bp.get("/api/me")
@@ -292,6 +297,28 @@ def create_app(prefix="", test_config=None):
         # 不碰 session：清 cookie 由 forest-data 的 /forest/logout 统一做，
         # 本应用只回地址，避免写出 Path=/exp-survey 的同名 cookie
         return jsonify(ok=True, logout_url=auth.logout_url())
+
+    @bp.post("/api/login")
+    def api_login_gone():
+        """v1.1 的登录接口已下线。
+
+        旧 WebView 缓存里的 app.js 仍会打这里；以前没人接，返回 404 HTML，
+        前端 response.json() 抛 "Unexpected token '<' … is not valid JSON"，
+        用户只看到一句"不是有效 JSON"。这里给一份可读的 JSON，把跳转地址也带上。
+        """
+        return jsonify(
+            error="登录已统一到森林门户，请重开应用或点「去登录」",
+            login_url=auth.login_url(),
+        ), 410
+
+    @bp.get("/admin/api/users")
+    @bp.post("/admin/api/users")
+    def admin_users_gone():
+        return jsonify(error="账号已统一到森林门户，请在门户后台管理"), 410
+
+    @bp.post("/admin/api/users/<path:username>/password")
+    def admin_reset_password_gone(username):
+        return jsonify(error="账号已统一到森林门户，请在门户后台改密"), 410
 
 
     # ── App 接口 ──────────────────────────────────────────────
@@ -705,6 +732,9 @@ def create_app(prefix="", test_config=None):
         # 发版后必须拿新页面；静态资源（带版本查询串）不受影响
         if response.mimetype == "text/html":
             response.headers["Cache-Control"] = "no-cache"
+        if (request.path or "").startswith("/static/") and request.args.get("v"):
+            # 带 ?v= 的资源内容随版本变，可长缓存：WebView 才不会拿旧 app.js
+            response.headers["Cache-Control"] = "public, max-age=604800"
         # 清历史残留：v1.1 及以前把 session cookie 写在 Path=/exp-survey，与 forest-data
         # 的 Path=/ 同名。浏览器"最长路径优先"→ 登出不掉、换账号串号（hqz-survey H9）。
         if prefix:
