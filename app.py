@@ -103,7 +103,7 @@ MIGRATIONS = (
 # 静态资源版本：每次发版递增，模板把它拼到 ?v= 上。
 # 原因：Capacitor WebView 会把 app.js 缓存到本地，HTML 改了但 JS 还是旧的 →
 # 旧页面继续 POST 已删除的 /api/login，拿到 404 HTML 就报 "is not valid JSON"。
-ASSET_VERSION = "v1.4.0"
+ASSET_VERSION = "v1.5.0"
 
 
 def parse_blob(filename, blob):

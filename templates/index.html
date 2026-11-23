@@ -97,10 +97,12 @@
 
       <div id="toolsGrid" class="tools-grid">
         <section id="photoCard" class="tool-card">
-          <div class="card-heading compact"><div><p class="eyebrow">FIELD PHOTOS</p><h2>样地照片</h2><p id="photoHint">自动等比压缩后添加水印。</p></div></div>
+          <div class="card-heading compact"><div><p class="eyebrow">FIELD PHOTOS</p><h2>样地照片</h2><p id="photoHint">拍照后压缩并写入手机相册。</p></div></div>
+          <!-- 原生 App 走 AppPermissions.takePhoto（直接进相机，不给相册入口）；
+               浏览器/旧包回退到 capture 输入框，同样只调相机、不提供「选择图片」 -->
           <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
-          <div class="button-row"><button id="takePhoto" class="button primary" type="button">拍摄 / 选择照片</button><span id="photoStatus" class="inline-status"></span></div>
-          <div id="photoList" class="photo-list"></div>
+          <div class="button-row"><button id="takePhoto" class="button primary" type="button">拍照</button><span id="photoStatus" class="inline-status"></span></div>
+          <div id="photoList" class="shot-list"></div>
         </section>
 
         <section id="trackCard" class="tool-card track-card hidden">
@@ -131,6 +133,7 @@
   <script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>
   <script src="{{ url_for('static', filename='vendor/piexif.js', v=asset_version) }}"></script>
   <script src="{{ url_for('static', filename='photo_exif.js', v=asset_version) }}"></script>
+  <script src="{{ url_for('static', filename='photo_tpl.js', v=asset_version) }}"></script>
   <script src="{{ url_for('static', filename='app.js', v=asset_version) }}"></script>
 </body>
 </html>

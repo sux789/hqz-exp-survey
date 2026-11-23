@@ -75,6 +75,12 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(params["压缩最长边"], 1440)
         self.assertEqual(params["压缩质量"], 0.8)
         self.assertEqual(params["source_sheet"], "")
+        # v1.5：照片只存相册，目录/文件名默认由模板给出；项目名称留空由 App 端回落 App 名
+        self.assertEqual(params["项目名称"], "")
+        self.assertEqual(params["说明"], "")
+        self.assertEqual(params["目录"], "{{项目名称}}/{{小班号}}")
+        self.assertEqual(params["相片文件名"], "{{项目名称}}_{{小班号}}_样地{{样地号}}_{{时间}}")
+        self.assertEqual(params["水印内容"], ["项目名称", "小班", "时间", "坐标"])
 
     def test_grouped_volume_matches_sample_formula(self):
         parsed = parse_workbook(SAMPLE)
@@ -112,6 +118,45 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(params["不显示列"], ["郁闭度"])
         self.assertEqual(params["水印内容"], ["时间", "小班"])
         self.assertEqual(params["source_sheet"], "程序参数")
+
+    def test_param_sheet_photo_templates_and_project_name(self):
+        """v1.5：项目名称 / 说明 / 目录 / 相片文件名 四个 key 进参数表（C20）。"""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "拍照参数.xlsx"
+            path.write_bytes(workbook_with_params([
+                ["项目名称", "2025年度中幼林抚育", "文本", "空", "", ""],
+                ["说明", "外业现地调查", "文本", "空", "", ""],
+                ["目录", "{{项目名称}}/{{小班号}}/样地{{样地号}}", "模板", "", "", ""],
+                ["相片文件名", "{{项目名称}}_{{小班号}}_{{时间}}", "模板", "", "", ""],
+                ["水印内容", "项目名称;小班;时间", "列表", "", "", ""],
+            ]))
+            params = parse_workbook(path)["params"]
+        self.assertEqual(params["项目名称"], "2025年度中幼林抚育")
+        self.assertEqual(params["说明"], "外业现地调查")
+        self.assertEqual(params["目录"], "{{项目名称}}/{{小班号}}/样地{{样地号}}")
+        self.assertEqual(params["相片文件名"], "{{项目名称}}_{{小班号}}_{{时间}}")
+        self.assertEqual(params["水印内容"], ["项目名称", "小班", "时间"])
+        self.assertEqual(public_params(params)["项目名称"], "2025年度中幼林抚育")
+
+    def test_param_sheet_rejects_bad_photo_templates(self):
+        """写错的占位符/破坏相册路径的值必须当场报错，不能静默变成空字符串。"""
+        cases = [
+            ([["目录", "{{小班}}", "模板", "", "", ""]], "未知占位符"),
+            ([["相片文件名", "{{小班号}}{{日期}}", "模板", "", "", ""]], "未知占位符"),
+            ([["相片文件名", "{{小班号}}/{{样地号}}", "模板", "", "", ""]], "不能包含"),
+            ([["目录", "/绝对路径", "模板", "", "", ""]], "相对路径"),
+            ([["目录", "../{{小班号}}", "模板", "", "", ""]], ".."),
+            ([["项目名称", "2025/中幼林", "文本", "", "", ""]], "项目名称"),
+        ]
+        for rows, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "坏拍照参数.xlsx"
+                    path.write_bytes(workbook_with_params(rows))
+                    with self.assertRaises(WorkbookError) as ctx:
+                        parse_workbook(path)
+                self.assertIn(expected, str(ctx.exception))
+                self.assertIn("第2行", str(ctx.exception))
 
     def test_param_sheet_rejects_bad_values_with_row_number(self):
         cases = [

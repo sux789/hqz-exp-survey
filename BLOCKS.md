@@ -15,7 +15,8 @@
 | B9 | 管理员后台（上传、预检覆盖、账号说明） | `templates/admin.html` `static/admin.js` | B3 API | 后台界面 | B3、B7、B8 |
 | B10 | gateway 部署与 APK 打包 | `deploy/` `deploy.sh` `android/` `.github/workflows/` | 源码 | 线上挂载 + APK | — |
 | B11 | 全量导出：一个项目 → 一个 xlsx、每小班一张 sheet | export_xlsx.py | schema + 全部小班 | xlsx 字节流 | B2 |
-| B12 | 照片水印与 EXIF 读/回写 | `static/photo_exif.js` `static/vendor/piexif.js` | 原片 File | 带水印且带 EXIF 的 JPEG | B4 |
+| B12 | 照片命名/目录/水印行 + EXIF 读回写 | `static/photo_tpl.js` `static/photo_exif.js` `static/vendor/piexif.js` | 参数+样地+原片 | 文件名/目录/水印/带 EXIF 图 | B4 |
+| B13 | 原生相机 + 相册写入 | `android/app/src/main/java/top/bibook/expsurvey/AppPermissionsPlugin.java` | takePhoto/savePhoto | 相册路径 | Capacitor |
 
 > 契约补充：B7 覆盖判定必须在后端（前端 disabled 只影响体验）；B8 报错必须带 Excel 行号且默认值等于 v1.0；B10 的 App 是远程 URL 壳，改网页不必重新出包。
 

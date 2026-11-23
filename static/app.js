@@ -390,15 +390,24 @@ function renderDetail() {
 
 /** 「程序参数」sheet 决定详情页显示哪些工具、照片怎么压。 */
 function applyParamsToDetail() {
+  const plot = currentPlot();
   const params = state.detail?.params || {};
   const hasPhoto = params.has_photo !== false;
   const hasTrack = params.has_track !== false;
   $('#photoCard').classList.toggle('hidden', !hasPhoto);
   $('#trackCard').classList.toggle('hidden', !hasTrack);
   $('#toolsGrid').classList.toggle('single', !hasPhoto || !hasTrack);
-  $('#photoHint').textContent = hasPhoto
-    ? `自动等比压缩至最长边 ${params.压缩最长边 || 1440}px、质量 ${params.压缩质量 ?? 0.8}；水印时间与坐标优先取原片 EXIF。`
-    : '';
+  if (hasPhoto) {
+    const ctx = PhotoTpl.context(params, {
+      number: state.detail?.fields?.number,
+      plotNo: plot?.plot_no,
+    });
+    $('#photoHint').textContent = `拍照后压缩到最长边 ${params.压缩最长边 || 1440}px、质量 `
+      + `${params.压缩质量 ?? 0.8}，存手机相册 Pictures/${PhotoTpl.albumSubdir(params, ctx)}/；`
+      + '时间与坐标优先取原片 EXIF。';
+  } else {
+    $('#photoHint').textContent = '';
+  }
   $('#trackStatus').textContent = hasTrack
     ? `卫星底图需要网络；每 ${params.轨迹采样间隔 || 5} 秒取一个定位点。`
     : '';
@@ -566,10 +575,38 @@ function updateSurveyInput(input) {
   scheduleSurveySave();
 }
 
+/* ── 本机拍摄记录（v1.5）───────────────────────────────────────────
+   照片只写手机相册、不上传服务器，所以界面上能给的只有「存到哪」这条线索：
+   文件名 + 相册相对路径 + 时间。记录存在本机 localStorage（按样地分键），
+   换设备/清缓存就没了 —— 权威副本永远是相册里的那张图。 */
+function shotsKey(plotId) {
+  return `forest_shots_plot_${plotId}`;
+}
+
+function readShots(plotId) {
+  try { return JSON.parse(localStorage.getItem(shotsKey(plotId)) || '[]'); } catch (_) { return []; }
+}
+
+function recordShot(shot) {
+  const plot = currentPlot();
+  if (!plot) return;
+  try {
+    const list = readShots(plot.id);
+    list.unshift(shot);
+    localStorage.setItem(shotsKey(plot.id), JSON.stringify(list.slice(0, 100)));
+  } catch (_) { /* 配额满不影响照片已存相册 */ }
+}
+
 function renderPhotos() {
-  const photos = currentPlot()?.photos || [];
-  $('#photoList').innerHTML = photos.length ? photos.map((photo) => `
-    <a class="photo-item" href="${photo.url}" target="_blank" rel="noopener"><img src="${photo.url}" alt="样地照片" loading="lazy"><span>${(photo.compressed_size / 1024).toFixed(0)} KB · ${formatDate(photo.created_at)}</span></a>`).join('') : '<span class="inline-status">暂无照片</span>';
+  const plot = currentPlot();
+  const shots = plot ? readShots(plot.id) : [];
+  const box = $('#photoList');
+  box.className = 'shot-list';
+  box.innerHTML = shots.length
+    ? shots.map((shot) => `<div class="shot-item" title="${escapeHtml(shot.path || '')}">
+        <strong>${escapeHtml(shot.name || 'photo.jpg')}</strong>
+        <span>${escapeHtml(shot.dir || '')} · ${escapeHtml(shot.at || '')}</span></div>`).join('')
+    : '<span class="inline-status">本次调查还没有拍照；照片存手机相册，不上传服务器。</span>';
 }
 
 function currentCoordinates() {
@@ -630,12 +667,12 @@ async function imageSource(file) {
 }
 
 /* 水印版式对齐 supervision：半透明白底块 + 实心黑字（省比特，同质量下体积更小、字更清楚）。
+   水印内容由参数「水印内容」逐行开关、由 photo_tpl.js 统一生成（项目名 → 小班/样地 → 说明 → 时间 → 坐标）。
    时间优先用原片 EXIF 的拍摄时刻，坐标同理；都没有才退回浏览器定位与当前时间。 */
-async function compressPhoto(file, coordinates, takenAt) {
+async function compressPhoto(file, ctx, coordinates) {
   const params = state.detail?.params || {};
   const maxEdge = Number(params.压缩最长边) || 1440;
   const quality = Math.min(1, Math.max(0.3, Number(params.压缩质量) || 0.8));
-  const marks = params.水印内容 || ['时间', '坐标', '小班'];
   const source = await imageSource(file);
   const width = source.width || source.naturalWidth;
   const height = source.height || source.naturalHeight;
@@ -647,19 +684,7 @@ async function compressPhoto(file, coordinates, takenAt) {
   context.drawImage(source, 0, 0, canvas.width, canvas.height);
   if (source.close) source.close();
 
-  const moment = (takenAt instanceof Date && !isNaN(takenAt)) ? takenAt : new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  const stamp = `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())}`
-    + ` ${pad(moment.getHours())}:${pad(moment.getMinutes())}:${pad(moment.getSeconds())}`;
-  const lines = [];
-  if (marks.includes('时间')) lines.push(`时间：${stamp}`);
-  if (marks.includes('坐标')) lines.push(`坐标：${coordinates || '定位未获取'}`);
-  if (marks.includes('小班')) {
-    const plot = currentPlot();
-    lines.push(plot && plot.plot_no !== '1'
-      ? `小班：${state.detail.fields.number}  样地：${plot.plot_no}`
-      : `小班：${state.detail.fields.number}`);
-  }
+  const lines = PhotoTpl.watermarkLines(params, ctx, coordinates);
   if (lines.length) {
     let fontSize = Math.max(18, Math.round(canvas.width / 34));
     let lineHeight = Math.round(fontSize * 1.45);
@@ -710,12 +735,64 @@ async function compressPhoto(file, coordinates, takenAt) {
     (blob) => (blob ? resolve(blob) : reject(new Error('图片编码失败'))), 'image/jpeg', quality));
 }
 
+/* ── 拍照（v1.5）：只存手机相册，不上传服务器 ──────────────────────
+   链路：原生相机 takePhoto → 取回原片 → 读 EXIF（时间/坐标）→ Canvas 压缩+水印
+        → 回写 EXIF → 原生 savePhoto 写入 Pictures/{参数「目录」}/{参数「文件名」}.jpg
+   任何跨端失败都不静默：宁可报错让调查员重拍，也不要照片存丢。
+   旧 APK（没有 AppPermissions 插件）明确提示升级，不再退回"上传服务器"这条已下线路径。 */
+function isNativeApp() {
+  return !!(window.Capacitor && typeof window.Capacitor.isNativePlatform === 'function'
+    && window.Capacitor.isNativePlatform());
+}
+
+function nativePlugin() {
+  const plugins = window.Capacitor && window.Capacitor.Plugins;
+  return (plugins && plugins.AppPermissions) || null;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** 原生相机拍一张，返回 File；没有插件时返回 null，由调用方回退到 capture 输入框。 */
+async function nativeCapture() {
+  const plugin = nativePlugin();
+  if (!isNativeApp() || !plugin || typeof plugin.takePhoto !== 'function') return null;
+  const shot = await plugin.takePhoto({});
+  if (!shot || !shot.path) throw new Error('相机没有返回照片');
+  let blob;
+  try {
+    const src = window.Capacitor.convertFileSrc ? window.Capacitor.convertFileSrc(shot.path) : shot.path;
+    blob = await (await fetch(src)).blob();
+  } catch (_) {
+    if (typeof plugin.readPhoto !== 'function') throw new Error('读取相机照片失败');
+    const raw = await plugin.readPhoto({ path: shot.path });   // 回退：原生读文件给 base64
+    blob = await (await fetch(`data:image/jpeg;base64,${raw.base64}`)).blob();
+  }
+  if (typeof plugin.removeCacheFile === 'function') {
+    try { await plugin.removeCacheFile({ path: shot.path }); } catch (_) { /* 缓存清理失败不影响出图 */ }
+  }
+  const name = String(shot.path).split('/').pop() || 'capture.jpg';
+  return new File([blob], name, { type: blob.type || 'image/jpeg' });
+}
+
 async function handlePhoto(file) {
   if (!file || !state.detail) return;
   if (!file.type.startsWith('image/')) {
-    toast('请选择图片文件', true);
+    toast('请用相机拍照（不再支持从相册选择）', true);
     return;
   }
+  const plot = currentPlot();
+  if (!plot) {
+    toast('当前小班还没有样地', true);
+    return;
+  }
+  const params = state.detail.params || {};
   $('#photoStatus').textContent = '正在读取定位与水印…';
   $('#takePhoto').disabled = true;
   try {
@@ -723,26 +800,88 @@ async function handlePhoto(file) {
     const coordinates = (meta && meta.lat != null)
       ? `${meta.lat.toFixed(5)}, ${meta.lng.toFixed(5)}`
       : await currentCoordinates();
-    const blob = await keepExif(file, await compressPhoto(file, coordinates, meta && meta.takenAt));
-    $('#photoStatus').textContent = `已压缩 ${(file.size / 1024).toFixed(0)} KB → ${(blob.size / 1024).toFixed(0)} KB，正在上传…`;
-    const plot = currentPlot();
-    if (!plot) throw new Error('当前小班还没有样地');
-    const form = new FormData();
-    form.append('file', blob, `${state.detail.fields.number}_样地${plot.plot_no}_${Date.now()}.jpg`);
-    form.append('original_size', file.size);
-    const data = await api(`/api/subcompartments/${state.detail.id}/plots/${plot.id}/photos`, { method: 'POST', body: form });
-    plot.photos.unshift(data.photo);
+    const ctx = PhotoTpl.context(params, {
+      number: state.detail.fields.number,
+      plotNo: plot.plot_no,
+    }, meta && meta.takenAt ? meta.takenAt : new Date());
+    const blob = await keepExif(file, await compressPhoto(file, ctx, coordinates));
+    const name = `${PhotoTpl.photoName(params, ctx)}.jpg`;
+    const subdir = PhotoTpl.albumSubdir(params, ctx);
+
+    let savedWhere = '';
+    let savedPath = '';
+    const plugin = nativePlugin();
+    if (isNativeApp()) {
+      // App 内只认相册这一条路：失败必须让调查员看见，不能悄悄"看起来存了"
+      if (!plugin || typeof plugin.savePhoto !== 'function') {
+        throw new Error('当前 App 版本不支持存相册，请更新到 v1.1 后再拍照');
+      }
+      try {
+        const saved = await plugin.savePhoto({ base64: await blobToBase64(blob), name, subdir });
+        savedPath = (saved && saved.path) || '';
+      } catch (err) {
+        throw new Error(`存入相册失败：${err.message || err}`);
+      }
+      savedWhere = savedPath ? `已存入相册：${savedPath}` : `已存入相册 Pictures/${subdir}/${name}`;
+    } else {
+      // 浏览器调试：直接下载到本机（页面没有相册写入权限）
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+      savedPath = name;
+      savedWhere = `已下载到本机：${name}`;
+    }
+
+    const dir = savedPath.includes('/')
+      ? savedPath.slice(0, savedPath.lastIndexOf('/'))
+      : `Pictures/${subdir}`;
+    recordShot({
+      name,
+      dir,
+      path: savedPath || `Pictures/${subdir}/${name}`,
+      at: ctx.时间显示,
+      size: Math.round(blob.size / 1024),
+    });
     renderPhotos();
-    $('#photoStatus').textContent = `已保存，压缩 ${Math.max(0, Math.round((1 - blob.size / file.size) * 100))}%`
-      + (meta ? '，EXIF 已保留' : '');
-    toast('照片压缩并保存成功');
+    $('#photoStatus').textContent = `${savedWhere}（${Math.round(blob.size / 1024)} KB，压缩 `
+      + `${Math.max(0, Math.round((1 - blob.size / file.size) * 100))}%${meta ? '，EXIF 已回写' : ''}）`;
+    toast('照片已存入手机相册');
   } catch (error) {
     $('#photoStatus').textContent = error.message;
-    toast(`照片处理失败：${error.message}`, true);
+    toast(`拍照失败：${error.message}`, true);
   } finally {
     $('#takePhoto').disabled = false;
     $('#photoInput').value = '';
   }
+}
+
+/** 拍照入口：原生相机优先，浏览器/旧包回退到 capture 输入框（只调相机，无相册入口）。 */
+async function startPhoto() {
+  if (!state.detail || !currentPlot()) return;
+  if (isNativeApp() && !nativePlugin()) {
+    toast('当前 App 版本过旧，请更新后再拍照（旧版没有相册保存能力）', true);
+    return;
+  }
+  const plugin = nativePlugin();
+  if (isNativeApp() && plugin && typeof plugin.takePhoto === 'function') {
+    $('#takePhoto').disabled = true;
+    $('#photoStatus').textContent = '正在打开相机…';
+    try {
+      const file = await nativeCapture();
+      if (file) await handlePhoto(file);
+    } catch (error) {
+      $('#photoStatus').textContent = error.message;
+      toast(`相机启动失败：${error.message}`, true);
+    } finally {
+      $('#takePhoto').disabled = false;
+    }
+    return;
+  }
+  $('#photoInput').click();
 }
 
 function trackCacheKey() {
@@ -934,7 +1073,7 @@ $('#plotNumber').addEventListener('keydown', (event) => {
 });
 $('#addPlot').addEventListener('click', addPlot);
 $('#deletePlot').addEventListener('click', deletePlot);
-$('#takePhoto').addEventListener('click', () => $('#photoInput').click());
+$('#takePhoto').addEventListener('click', startPhoto);
 $('#photoInput').addEventListener('change', (event) => handlePhoto(event.target.files[0]));
 $('#toggleTrack').addEventListener('click', () => state.recording ? stopTracking(true) : startTracking());
 $('#saveTrack').addEventListener('click', () => saveTrack(true));

@@ -2,17 +2,29 @@
 """「程序参数」sheet 解析器。
 
 一块 Excel 既能当调查基础数据，也能当行为配置：在第一个 sheet 之外增加一张
-「程序参数」sheet（兼容旧名「参数」），用 key|value 描述 App 该显示什么、照片怎么压。
+「程序参数」sheet（兼容旧名「参数」），用 key|value 描述 App 该显示什么、照片怎么压、
+照片存到手机相册的哪一层、文件名叫什么。
 
 约定（与 hqz-supervision 的参数表同构，便于两份 Excel 互相迁移）：
 - 表头固定 6 列：key | value | 类型 | 默认值 | 说明 | 示例
 - 多值用半角 ';'；**拒绝全角分隔符**（全角分号会把一个值静默切成两个，是坏数据）
-- 未知 key / 非法取值 / 越界数值 → ParamError，消息带 Excel 行号
+- 未知 key / 非法取值 / 越界数值 / 未知占位符 → ParamError，消息带 Excel 行号
 - 没有这张 sheet → 全部取默认值（v1.3 起默认只拍照、不含轨迹，见 C17）
+
+v1.5 起新增四个 key —— 照片不再上传服务器，改为写入手机相册：
+- 项目名称（文本）：相册顶层目录、水印、文件名里的项目名，留空由 App 端取 App 名兜底
+- 说明（文本）：水印里的一行说明文字，留空不显示
+- 目录（模板）：相册子目录 Pictures/{目录}/，默认 `{{项目名称}}/{{小班号}}`
+- 相片文件名（模板）：不含扩展名，默认 `{{项目名称}}_{{小班号}}_样地{{样地号}}_{{时间}}`
+
+模板占位符只有五个：{{项目名称}} {{说明}} {{小班号}} {{样地号}} {{时间}}（时间=YYYYMMDD_HHMMSS），
+**未知占位符一律报错**——写错的占位符会静默变空，文件名只剩时间戳，事后无法按小班追溯。
 
 sheet 名不参与「第一个 sheet 是基础数据」的判定：基础数据永远取第一个 sheet（C12），
 若用户把「程序参数」放到了第一位，这里会给出可读的报错而不是让小班解析莫名失败。
 """
+
+import re
 
 from openpyxl.utils import get_column_letter
 
@@ -21,20 +33,30 @@ HEADER = ("key", "value", "类型", "默认值", "说明", "示例")
 FULLWIDTH = {"；": ";", "｜": "|", "，": ","}
 
 FEATURES = ("拍照", "视频", "轨迹", "打卡")
-WATERMARKS = ("时间", "坐标", "小班")
+WATERMARKS = ("项目名称", "小班", "时间", "坐标")
+TEMPLATE_VARS = ("项目名称", "说明", "小班号", "样地号", "时间")
+TEXT_LIMITS = {"项目名称": 40, "说明": 80}
 
 # key -> (类型, 可选值或取值区间, 默认值, 说明)
 KEYS = {
     "功能": ("列表", FEATURES, "拍照",
              "App 详情页显示哪些工具；默认只拍照，需要轨迹就加上「轨迹」"),
+    "项目名称": ("文本", None, "",
+                 "照片相册顶层目录、水印与文件名里的项目名；留空用 App 名「抚育调查」"),
+    "说明": ("文本", None, "",
+             "照片水印里的一行说明文字；留空不显示"),
+    "目录": ("模板", None, "{{项目名称}}/{{小班号}}",
+             "照片在本机相册的子目录：Pictures/{目录}/；用半角 / 分层"),
+    "相片文件名": ("模板", None, "{{项目名称}}_{{小班号}}_样地{{样地号}}_{{时间}}",
+                   "照片文件名（不含扩展名）；{{时间}}=YYYYMMDD_HHMMSS"),
+    "水印内容": ("列表", WATERMARKS, "项目名称;小班;时间;坐标",
+                 "照片水印逐行内容；去掉「坐标」即不写定位"),
     "压缩最长边": ("数值", (320, 4096), 1440,
                    "照片压缩后最长边像素，仅影响新拍照片"),
     "压缩质量": ("数值", (0.3, 1.0), 0.8,
                  "JPEG 质量 0.3-1.0，越小文件越小"),
     "不显示列": ("列表", None, "",
                  "小班列表要隐藏的列名，必须是基础数据表头"),
-    "水印内容": ("列表", WATERMARKS, "时间;坐标;小班",
-                 "照片水印逐行内容；去掉「坐标」即不写定位"),
     "轨迹采样间隔": ("数值", (1, 60), 5,
                      "记录轨迹时取点间隔（秒），越大越省电"),
 }
@@ -88,6 +110,67 @@ def _number(value, row_no, key, low, high, integer):
             raise ParamError(f"程序参数第{row_no}行 key「{key}」：必须是整数，实际 {result}")
         return int(result)
     return round(result, 3)
+
+
+def _text_param(key, value, row_no):
+    """文本型 key（项目名称 / 说明）：去空白、拒绝控制字符与破坏路径的字符。"""
+    text = _text(value)
+    if any(ord(ch) < 32 for ch in text):
+        raise ParamError(
+            f"程序参数第{row_no}行 key「{key}」：不能包含换行或控制字符"
+        )
+    limit = TEXT_LIMITS.get(key)
+    if limit and len(text) > limit:
+        raise ParamError(
+            f"程序参数第{row_no}行 key「{key}」：长度 {len(text)} 超过 {limit} 字"
+        )
+    if key == "项目名称":
+        for bad in ("/", "\\", ".."):
+            if bad in text:
+                raise ParamError(
+                    f"程序参数第{row_no}行 key「项目名称」：不能包含 {bad!r}；"
+                    f"分层目录请写在「目录」里"
+                )
+    return text
+
+
+def _template_param(key, value, row_no):
+    """模板型 key（目录 / 相片文件名）：占位符必须成对且只允许已知变量。
+
+    写错的占位符（如 {{小班}}、{{样地}}）会被静默替换成空串，照片就只剩时间戳，
+    事后无法按小班追溯——所以这里按坏数据拒收，并把可用占位符列在消息里。
+    """
+    text = _text(value)
+    if not text:
+        raise ParamError(f"程序参数第{row_no}行 key「{key}」：模板不能为空")
+
+    leftover = re.sub(r"\{\{[^{}]*\}\}", "", text)
+    if "{" in leftover or "}" in leftover:
+        raise ParamError(
+            f"程序参数第{row_no}行 key「{key}」：占位符必须写成 {{{{列名}}}}（双花括号完整配对），"
+            f"实际 {text!r}"
+        )
+    used = [item.strip() for item in re.findall(r"\{\{([^{}]*)\}\}", text)]
+    unknown = [item for item in used if item not in TEMPLATE_VARS]
+    if unknown:
+        raise ParamError(
+            f"程序参数第{row_no}行 key「{key}」：未知占位符 {'、'.join(unknown)}；"
+            f"可用 {'、'.join(TEMPLATE_VARS)}"
+        )
+    if key == "相片文件名" and ("/" in text or "\\" in text):
+        raise ParamError(
+            f"程序参数第{row_no}行 key「相片文件名」：不能包含 / 或 \\；分层目录请写在「目录」里"
+        )
+    if key == "目录":
+        if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+            raise ParamError(
+                f"程序参数第{row_no}行 key「目录」：必须是相册内的相对路径，不能以 / 或盘符开头"
+            )
+        if any(seg.strip() in (".", "..") for seg in text.split("/")):
+            raise ParamError(
+                f"程序参数第{row_no}行 key「目录」：不允许 . 或 .. 路径段"
+            )
+    return text
 
 
 def _list_items(key, value, row_no, headers):
@@ -183,6 +266,12 @@ def parse_program_params(wb, base_headers):
         if kind == "列表":
             values[key] = _list_items(key, value, row_no, headers)
             continue
+        if kind == "文本":
+            values[key] = _text_param(key, value, row_no)
+            continue
+        if kind == "模板":
+            values[key] = _template_param(key, value, row_no)
+            continue
         if key == "轨迹采样间隔" and not track_on:
             continue  # 不开轨迹 → 该项不生效，保持默认值，不因 0 之类的值拒收整份工作簿
         low, high = allowed
@@ -199,16 +288,14 @@ def default_params():
 
     v1.3 起默认**不显示轨迹**：外业手机定位耗电且多数小班不需要留轨迹，
     需要时在参数 sheet 的「功能」里加「轨迹」即可，其余默认值不变。
+    v1.5 起从 KEYS 直接派生，新增 key 不会漏掉默认值（漏掉的 key 会让前端拿到
+    undefined，照片目录退化成兜底值）。
     """
-    return {
-        "功能": _split(KEYS["功能"][2], 0, "功能"),
-        "压缩最长边": KEYS["压缩最长边"][2],
-        "压缩质量": KEYS["压缩质量"][2],
-        "不显示列": [],
-        "水印内容": _split(KEYS["水印内容"][2], 0, "水印内容"),
-        "轨迹采样间隔": KEYS["轨迹采样间隔"][2],
-        "source_sheet": DEFAULT_SOURCE,
-    }
+    params = {}
+    for key, (kind, _allowed, default, _desc) in KEYS.items():
+        params[key] = _split(default, 0, key) if kind == "列表" else default
+    params["source_sheet"] = DEFAULT_SOURCE
+    return params
 
 
 def public_params(params):

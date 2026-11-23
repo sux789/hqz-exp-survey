@@ -38,13 +38,18 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- 拍照：WebView 的 input capture 需要相机权限（hqz-survey G1 教训） -->
+    <!-- 拍照：原生 ACTION_IMAGE_CAPTURE 需要相机权限（v1.5 起照片只存相册，不再读相册） -->
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- 卫星轨迹与照片水印取定位 -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <!-- Android 13+ 从相册选照片 -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+    <!-- Android 11+ 查可见性：不声明 queries 时系统相机 Intent 可能找不到处理器 -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
 
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
