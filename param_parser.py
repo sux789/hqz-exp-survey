@@ -90,11 +90,43 @@ def _number(value, row_no, key, low, high, integer):
     return round(result, 3)
 
 
+def _list_items(key, value, row_no, headers):
+    """列表型 key（功能 / 水印内容 / 不显示列）的取值校验。"""
+    items = _split(value, row_no, key)
+    if key == "功能":
+        unknown = [item for item in items if item not in FEATURES]
+        if unknown:
+            raise ParamError(
+                f"程序参数第{row_no}行「功能」：未知取值 {('、'.join(unknown))}；"
+                f"可选 {'、'.join(FEATURES)}"
+            )
+    elif key == "水印内容":
+        unknown = [item for item in items if item not in WATERMARKS]
+        if unknown:
+            raise ParamError(
+                f"程序参数第{row_no}行「水印内容」：未知取值 {('、'.join(unknown))}；"
+                f"可选 {'、'.join(WATERMARKS)}"
+            )
+    elif key == "不显示列":
+        unknown = [item for item in items if item not in headers]
+        if unknown:
+            raise ParamError(
+                f"程序参数第{row_no}行「不显示列」：{('、'.join(unknown))} 不在基础数据表头中；"
+                f"现有表头：{'、'.join(sorted(headers))}"
+            )
+    return items
+
+
 def parse_program_params(wb, base_headers):
     """解析参数表。
 
     wb: openpyxl Workbook；base_headers: 第一个 sheet 的表头列名（用于校验「不显示列」）。
     返回 dict；无参数表时返回默认值（source_sheet 为空串）。
+
+    分两遍：「功能」先落地，再按「轨迹是否开启」决定「轨迹采样间隔」是否要校验。
+    表内说明本来就写着「不开轨迹时该项不生效」，所以不开轨迹时填 0 或其他越界值
+    都不该拖垮整份工作簿——历史总表用 0 表示「不要轨迹」，曾导致上传被整份拒绝。
+    反过来，**开了轨迹**就必须是合法值，错误在这时才暴露，不会被悄悄吃掉。
     """
     ws = find_param_sheet(wb)
     if ws is None:
@@ -104,9 +136,10 @@ def parse_program_params(wb, base_headers):
         raise ParamError("程序参数 sheet 只有表头，没有配置行")
 
     headers = set(base_headers)
-    values = {}
     columns = 6
     header_checked = False
+    rows = []
+    seen = set()
 
     for row_no in range(1, ws.max_row + 1):
         cells = [_text(ws.cell(row_no, index).value) for index in range(1, columns + 1)]
@@ -129,40 +162,31 @@ def parse_program_params(wb, base_headers):
             raise ParamError(
                 f"程序参数第{row_no}行：未知 key「{key}」；合法 key：{'、'.join(KEYS)}"
             )
-        if key in values:
+        if key in seen:
             raise ParamError(f"程序参数第{row_no}行：key「{key}」重复配置")
-
-        kind, allowed, _default, _desc = KEYS[key]
-        if kind == "列表":
-            items = _split(value, row_no, key)
-            if key == "功能":
-                unknown = [item for item in items if item not in FEATURES]
-                if unknown:
-                    raise ParamError(
-                        f"程序参数第{row_no}行「功能」：未知取值 {('、'.join(unknown))}；"
-                        f"可选 {'、'.join(FEATURES)}"
-                    )
-            elif key == "水印内容":
-                unknown = [item for item in items if item not in WATERMARKS]
-                if unknown:
-                    raise ParamError(
-                        f"程序参数第{row_no}行「水印内容」：未知取值 {('、'.join(unknown))}；"
-                        f"可选 {'、'.join(WATERMARKS)}"
-                    )
-            elif key == "不显示列":
-                unknown = [item for item in items if item not in headers]
-                if unknown:
-                    raise ParamError(
-                        f"程序参数第{row_no}行「不显示列」：{('、'.join(unknown))} 不在基础数据表头中；"
-                        f"现有表头：{'、'.join(sorted(headers))}"
-                    )
-            values[key] = items
-        else:
-            low, high = allowed
-            values[key] = _number(value, row_no, key, low, high, integer=key != "压缩质量")
+        seen.add(key)
+        rows.append((row_no, key, value))
 
     if not header_checked:
         raise ParamError("程序参数 sheet 未找到 key|value 表头")
+
+    values = {}
+    for row_no, key, value in rows:
+        if key == "功能":
+            values[key] = _list_items(key, value, row_no, headers)
+    track_on = "轨迹" in values.get("功能", default_params()["功能"])
+
+    for row_no, key, value in rows:
+        if key == "功能":
+            continue
+        kind, allowed, _default, _desc = KEYS[key]
+        if kind == "列表":
+            values[key] = _list_items(key, value, row_no, headers)
+            continue
+        if key == "轨迹采样间隔" and not track_on:
+            continue  # 不开轨迹 → 该项不生效，保持默认值，不因 0 之类的值拒收整份工作簿
+        low, high = allowed
+        values[key] = _number(value, row_no, key, low, high, integer=key != "压缩质量")
 
     params = default_params()
     params.update(values)

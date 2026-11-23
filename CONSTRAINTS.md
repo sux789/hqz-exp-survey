@@ -21,7 +21,7 @@
 | C14 | **上传/覆盖只走 `/admin/`**：所有 `/admin/api/*` 必须 `@admin_required`；覆盖必须服务端校验 `uploader == 当前用户 或 is_owner`，且 `confirm` 等于当前项目文件名——前端确认不算数。App 端 `POST /api/projects` 永久返回 403 指向后台 | 应用 v1.1 | 反转 v1.0「任意访问者可上传」 |
 | C15 | **程序参数 sheet 是配置，不是数据**：第一个 sheet 永远是基础数据（C12），参数表若在第一位必须明确报错；未知 key / 重复 key / 全角分隔符 / 非法取值 / 越界数值 / 隐藏列不在表头，全部带 Excel 行号报错；**无参数表时行为必须等于 v1.0 默认值** | 应用 v1.1 | 默认值部分被 C17 反转（轨迹默认关，其余不变） |
 | C16 | **登录态只读 forest-data**：`SECRET_KEY` 必须取自 `forest-data/web/.secret_key`，`SESSION_COOKIE_PATH` 必须 `"/"`，**禁止**设 `APPLICATION_ROOT`、**禁止**在本应用写 session（含 `session.clear()`）；页面与接口跳转一律用 `request.script_root`，禁止硬编码 `/`。原因：cookie 写 `Path=/exp-survey` 会与门户 `Path=/` 同名遮蔽 → 登出不掉、换账号串号（hqz-survey 2026-08-24 修复，H9）；硬编码 `/` 在网关下会跳回 gateway 首页。守卫：`tests/test_app.GatewayMountTests`（cookie 路径 + next 前缀 + 只读取用户） | 应用 v1.2 | 反转 v1.1「`APPLICATION_ROOT=prefix` 用于限定 cookie 与 https」 |
-| C17 | **轨迹默认关闭**：无参数表时「功能」默认 `拍照`（不含「轨迹」）；轨迹是否可用**只由「功能」一个开关**决定，不得再加第二个布尔键（会出现「功能含轨迹但显示轨迹=否」的矛盾态）。原因：外业定位耗电、多数小班不需要。守卫：`tests/test_app` 的默认参数断言 + 「未开启轨迹时 PUT /track 返回 400」 | 应用 v1.3 | 反转 C15「无参数表时行为等于 v1.0（拍照+轨迹）」 |
+| C17 | **轨迹默认关闭**：无参数表时「功能」默认 `拍照`（不含「轨迹」）；轨迹是否可用**只由「功能」一个开关**决定，不得再加第二个布尔键（会出现「功能含轨迹但显示轨迹=否」的矛盾态）。原因：外业定位耗电、多数小班不需要。守卫：`tests/test_app` 的默认参数断言 + 「未开启轨迹时 PUT /track 返回 400」+ 「不开轨迹时采样间隔不校验、开轨迹时仍报错」 | 应用 v1.3 | 反转 C15「无参数表时行为等于 v1.0（拍照+轨迹）」 |
 | C18 | **导出粒度**：本项目「全量导出」= 一个项目一个 xlsx、**每个小班一张 sheet**，口径必须复用 `calculations`（不得在导出里另算一套材积）；未调查的小班也必须有一张 sheet 并写明「尚未录入」，否则会被当成漏导。守卫：`tests/test_app.ExportTests`+ `ApiTests` 的 684 张 sheet 断言 | 应用 v1.3 | — |
 
 <!-- C 编号用于 STATE.md 的「活跃约束」区间，`bash tools/run.sh --status` 会自动读取。

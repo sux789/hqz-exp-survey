@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from app import ASSET_VERSION, create_app
 from calculations import calculate_summary, unit_volume
 from export_xlsx import build_project_workbook
+from param_parser import public_params
 from workbook import WorkbookError, parse_workbook
 
 
@@ -129,6 +130,36 @@ class WorkbookTests(unittest.TestCase):
                         parse_workbook(path)
                 self.assertIn(expected, str(ctx.exception))
                 self.assertIn("第2行", str(ctx.exception))
+
+    def test_track_interval_is_ignored_while_track_is_off(self):
+        """不开轨迹时「轨迹采样间隔」不生效：填 0 不能拖垮整份工作簿。
+
+        真实总表（tpl/中幼林抚育…总表.xlsx）就用 0 表示「不要轨迹」，
+        历史上因此整份上传被拒（ParamError 越界），这里锁住该口径。
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "关闭轨迹.xlsx"
+            path.write_bytes(workbook_with_params([
+                ["功能", "拍照", "列表", "拍照;轨迹", "只拍照", ""],
+                ["轨迹采样间隔", "0", "数值", "5", "不开轨迹时填 0", ""],
+            ]))
+            params = parse_workbook(path)["params"]
+        self.assertEqual(params["功能"], ["拍照"])
+        self.assertEqual(params["轨迹采样间隔"], 5)          # 回落默认值，不采用非法的 0
+        self.assertFalse(public_params(params)["has_track"])
+
+    def test_track_interval_still_validated_when_track_is_on(self):
+        """开了轨迹就必须是 1-60；错误在这时才暴露，不被静默吃掉（C17 单开关）。"""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "开轨迹但间隔非法.xlsx"
+            path.write_bytes(workbook_with_params([
+                ["功能", "拍照;轨迹", "列表", "拍照", "打开轨迹", ""],
+                ["轨迹采样间隔", "0", "数值", "5", "", ""],
+            ]))
+            with self.assertRaises(WorkbookError) as ctx:
+                parse_workbook(path)
+        self.assertIn("轨迹采样间隔", str(ctx.exception))
+        self.assertIn("超出范围", str(ctx.exception))
 
 
 class ApiTests(unittest.TestCase):
