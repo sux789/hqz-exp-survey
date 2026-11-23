@@ -15,7 +15,7 @@
       <div><strong>调查数据管理</strong><small>上传与更新 Excel</small></div>
     </div>
     <span class="spacer"></span>
-    <span class="current-user">{{ user }}{% if is_owner %} · 超级管理员{% endif %}</span>
+    <span id="currentUser" class="current-user">{{ user }}{% if is_admin %} · 管理员{% endif %}</span>
     <a class="top-link" href="../">返回 App</a>
     <button id="logoutButton" class="top-link" type="button">退出</button>
   </header>
@@ -44,7 +44,7 @@
 
     <section class="admin-card">
       <div class="card-heading">
-        <div><h2>已有项目</h2><p>只有上传人本人或超级管理员可以覆盖；其余人只能查看与下载源文件。</p></div>
+        <div><h2>已有项目</h2><p>只有上传人本人或管理员可以覆盖；其余人只能查看与下载源文件。</p></div>
         <span class="count-badge" id="projectCount">0 个</span>
       </div>
       <div class="table-scroll">
@@ -58,20 +58,12 @@
 
     <section class="admin-card">
       <div class="card-heading">
-        <div><h2>用户</h2><p>admin 可进入本页并上传；只有超级管理员能管理其他管理员。</p></div>
+        <div><h2>账号与权限</h2>
+          <p>本应用使用森林门户统一账号，账号、密码、启用与过期都在门户后台维护，这里不再单独建号。</p></div>
       </div>
-      <form id="userForm" class="inline-form">
-        <label>用户名<input id="newUserName" maxlength="30" required></label>
-        <label>初始密码<input id="newUserPwd" type="text" minlength="6" required></label>
-        <label>角色<select id="newUserRole"><option value="user">user（只调查）</option><option value="admin">admin（可管理）</option></select></label>
-        <label class="check-label"><input id="newUserOwner" type="checkbox"> 超级管理员</label>
-        <button class="button secondary" type="submit">添加用户</button>
-      </form>
-      <div class="table-scroll">
-        <table class="data-table admin-table">
-          <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
-          <tbody id="userRows"></tbody>
-        </table>
+      <div class="button-row">
+        <a class="button secondary" href="/admin" target="_blank" rel="noopener">打开门户账号管理</a>
+        <span class="inline-status">覆盖口径：管理员可覆盖任何人，其他人只能覆盖自己上传的项目。</span>
       </div>
     </section>
   </main>

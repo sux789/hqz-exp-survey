@@ -2,7 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const BASE = (document.querySelector('meta[name="exp-base"]')?.content || '').replace(/\/+$/, '');
 const url = (path) => `${BASE}${path.startsWith('/') ? path : `/${path}`}`;
 
-const state = { me: null, projects: [], users: [], target: null, file: null, toastTimer: null };
+const state = { me: null, projects: [], target: null, file: null, toastTimer: null };
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -24,7 +24,7 @@ async function api(path, options = {}) {
   const type = response.headers.get('content-type') || '';
   const payload = type.includes('application/json') ? await response.json() : null;
   if (response.status === 401) {
-    location.href = `${BASE}/`;
+    location.href = payload?.login_url || '/forest/login';
     throw new Error('请先登录');
   }
   if (!response.ok) throw new Error(payload?.error || `请求失败（${response.status}）`);
@@ -49,7 +49,7 @@ async function loadProjects() {
   const data = await api('/admin/api/projects');
   state.projects = data.projects;
   const rows = state.projects.map((project) => {
-    const disabled = project.can_overwrite ? '' : 'disabled title="只有上传人本人或超级管理员可以覆盖"';
+    const disabled = project.can_overwrite ? '' : 'disabled title="只有上传人本人或管理员可以覆盖"';
     return `<tr>
       <td><strong>${escapeHtml(project.filename)}</strong><small>${escapeHtml(project.id.slice(0, 8))}</small></td>
       <td>${project.subcompartment_count}</td>
@@ -211,68 +211,14 @@ function bindUpdate() {
   });
 }
 
-// ── 用户 ──────────────────────────────────────────────────
-function renderUsers() {
-  $('#userRows').innerHTML = state.users.map((user) => `
-    <tr>
-      <td><strong>${escapeHtml(user.username)}</strong></td>
-      <td>${user.is_owner ? '超级管理员' : user.role === 'admin' ? '管理员' : '调查员'}</td>
-      <td>${escapeHtml(user.created_at)}</td>
-      <td class="row-actions"><button class="button secondary small" type="button" data-reset="${escapeHtml(user.username)}">重置密码</button></td>
-    </tr>`).join('');
-  document.querySelectorAll('[data-reset]').forEach((button) => {
-    button.addEventListener('click', () => resetPassword(button.dataset.reset));
-  });
-}
-
-async function loadUsers() {
-  const data = await api('/admin/api/users');
-  state.users = data.users;
-  renderUsers();
-}
-
-async function resetPassword(username) {
-  const password = prompt(`把「${username}」的密码重置为：`);
-  if (!password) return;
-  try {
-    await api(`/admin/api/users/${encodeURIComponent(username)}/password`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-    toast('密码已重置');
-  } catch (error) {
-    toast(error.message, true);
-  }
-}
-
-function bindUserForm() {
-  $('#userForm').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    try {
-      await api('/admin/api/users', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: $('#newUserName').value.trim(),
-          password: $('#newUserPwd').value,
-          role: $('#newUserRole').value,
-          is_owner: $('#newUserOwner').checked,
-        }),
-      });
-      $('#newUserName').value = '';
-      $('#newUserPwd').value = '';
-      $('#newUserOwner').checked = false;
-      toast('用户已添加');
-      await loadUsers();
-    } catch (error) {
-      toast(error.message, true);
-    }
-  });
-}
-
 // ── 启动 ──────────────────────────────────────────────────
 $('#logoutButton').addEventListener('click', async () => {
-  try { await api('/api/logout', { method: 'POST' }); } catch (_) {}
-  location.href = `${BASE}/`;
+  let target = '/forest/logout';
+  try {
+    const payload = await api('/api/logout', { method: 'POST' });
+    target = payload?.logout_url || target;
+  } catch (_) {}
+  location.href = target;
 });
 
 async function init() {
@@ -283,10 +229,11 @@ async function init() {
       return;
     }
     state.me = me;
+    const nameNode = $('#currentUser');
+    if (nameNode) nameNode.textContent = me.display_name || me.user;
     bindNewFile();
     bindUpdate();
-    bindUserForm();
-    await Promise.all([loadProjects(), loadUsers()]);
+    await loadProjects();
   } catch (error) {
     toast(error.message, true);
   }

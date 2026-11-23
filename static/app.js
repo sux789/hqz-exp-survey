@@ -42,19 +42,24 @@ async function api(path, options = {}) {
   const type = response.headers.get('content-type') || '';
   const payload = type.includes('application/json') ? await response.json() : null;
   if (response.status === 401) {
-    showLogin();
+    showLogin(payload?.login_url);
     throw new Error(payload?.error || '登录已过期，请重新登录');
   }
   if (!response.ok) throw new Error(payload?.error || `请求失败（${response.status}）`);
   return payload;
 }
 
-function showLogin() {
+function showLogin(loginUrl) {
+  // 统一账号：登录在森林门户 /forest/login 做，这里只给入口，不再收密码
+  const target = loginUrl || `${BASE}/`;
+  const link = $('#loginLink');
+  if (link) {
+    link.href = target.startsWith('/forest/') ? target : `/forest/login?next=${encodeURIComponent(target)}`;
+  }
   $('#loginMask').classList.remove('hidden');
   $('#currentUser').classList.add('hidden');
   $('#adminLink').classList.add('hidden');
   $('#logoutButton').classList.add('hidden');
-  setTimeout(() => $('#loginUser').focus(), 50);
 }
 
 function hideLogin() {
@@ -717,44 +722,23 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-$('#loginForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const errorNode = $('#loginError');
-  errorNode.textContent = '';
-  try {
-    const response = await fetch(url('/api/login'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: $('#loginUser').value.trim(), password: $('#loginPwd').value }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      errorNode.textContent = payload.error || '登录失败';
-      return;
-    }
-    state.me = payload;
-    $('#loginPwd').value = '';
-    hideLogin();
-    updateTopbar();
-    await handleRoute();
-  } catch (error) {
-    errorNode.textContent = error.message;
-  }
-});
-
 $('#logoutButton').addEventListener('click', async () => {
-  try { await fetch(url('/api/logout'), { method: 'POST' }); } catch (_) {}
+  let target = '/forest/logout';
+  try {
+    const payload = await fetch(url('/api/logout'), { method: 'POST' }).then((r) => r.json());
+    target = payload?.logout_url || target;
+  } catch (_) {}
   state.me = null;
   state.detail = null;
   state.project = null;
-  showLogin();
+  location.href = target;
 });
 
 async function bootstrap() {
   try {
     const me = await fetch(url('/api/me')).then((response) => response.json());
     if (!me.user) {
-      showLogin();
+      showLogin(me.login_url);
       return;
     }
     state.me = me;

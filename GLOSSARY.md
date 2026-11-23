@@ -11,5 +11,7 @@
 | 卫星轨迹 | 浏览器定位产生并按时间排列的 WGS-84 点序列 | GPS 轨迹 | 不是只有起终点的直线 |
 | 程序参数 | `程序参数`（兼容 `参数`）sheet 中 key→value 的配置行，控制功能开关、照片压缩、隐藏列与采样间隔 | 参数表、配置 sheet | 不是调查基础数据，不参与材积计算 |
 | 上传人 | `projects.uploader`，记录首次上传该项目的用户名；覆盖时用于判定权限 | 归属人 | 不是最近一次修改人（覆盖不改变上传人） |
-| 超级管理员 | `users.is_owner=1` 的 admin，可覆盖任何人上传的项目、可管理其他 admin | 超管、owner | 不是普通 admin（只能覆盖自己上传的） |
+| 超级管理员 | 历史概念，v1.2 起并入「管理员」：forest-data `users.is_admin=1` 即可覆盖任何人上传的项目 | 超管、owner | 不是普通用户（只能覆盖自己上传的） |
+| 统一账号 | forest-data（森林门户 `/forest`）的账号体系；exp-survey 只读其 session，不自建账号 | 门户账号、forest-data 用户体系 | 不是本应用 `instance/survey.sqlite3` 里的账号 |
+| 登录态 | 门户登录后写入的 `session["user_id"]`，本应用每次请求现查 `users` 表校验 `is_active` 与 `expires_at` | 会话、cookie | 不是本应用自己签发的 token |
 | 覆盖更新 | 按小班号对齐新 Excel，就地更新基础数据并保留调查/照片/轨迹；需输入项目文件名确认 | 更新 Excel | 不是新建项目（不产生新 project id） |

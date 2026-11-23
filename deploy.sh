@@ -20,6 +20,13 @@ if [ ! -f "$APPSPEC" ]; then
   exit 2
 fi
 
+echo "0/5 预检 forest-data 凭证（统一账号靠它，缺一个全员登录失效）"
+if ! ssh "$REMOTE" "test -r /home/www/bibook_deploy/apps/forest-data/web/.secret_key && test -r '$DB'"; then
+  echo "预检失败：gateway 进程读不到 forest-data 的 .secret_key 或 forest_web.db" >&2
+  echo "  期望：/home/www/bibook_deploy/apps/forest-data/web/{.secret_key,forest_web.db} 对 www 可读" >&2
+  exit 3
+fi
+
 echo "1/5 建目录并同步代码 → $REMOTE:$DEST"
 ssh "$REMOTE" "mkdir -p '$DEST/instance' '$GATEWAY/apps_root'"
 # 注意：--exclude 用 '/' 锚定，避免误伤同名子目录（supervision 踩坑固化）
@@ -47,4 +54,9 @@ echo "5/5 重启 gateway 并验证"
 ssh "$REMOTE" "systemctl --user restart gateway.service"
 sleep 2
 code=$(curl -s -o /dev/null -w "%{http_code}" https://forest.bibook.top/exp-survey/)
-echo "deploy: 已同步；GET /exp-survey/ → $code（期望 200 或 302 登录跳转）"
+loc=$(curl -s -o /dev/null -w "%{redirect_url}" https://forest.bibook.top/exp-survey/)
+echo "deploy: 已同步；GET /exp-survey/ → $code ${loc:+→ $loc}"
+case "$loc" in
+  *forest/login*) echo "  登录跳转正常（统一账号）" ;;
+  *) echo "  警告：未跳到 /forest/login，检查 secret_key / FOREST_DB" >&2 ;;
+esac

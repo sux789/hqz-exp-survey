@@ -10,8 +10,8 @@ from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from flask import (
-    Blueprint, Flask, Response, g, jsonify, redirect, render_template, request,
-    send_file, session,
+    Blueprint, Flask, Response, g, jsonify, render_template, request,
+    send_file,
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -86,19 +86,6 @@ MIGRATIONS = (
 )
 
 
-def _secret_key(instance_path):
-    """多 worker 必须共享同一把 key，否则 session 互踢（supervision 同款踩坑）。"""
-    env = os.environ.get("EXP_SECRET_KEY")
-    if env:
-        return env
-    path = Path(instance_path) / ".secret_key"
-    if path.exists():
-        return path.read_text(encoding="utf-8").strip()
-    key = uuid.uuid4().hex
-    path.write_text(key, encoding="utf-8")
-    return key
-
-
 def parse_blob(filename, blob):
     """内存解析：dry 预览不落盘、不产生垃圾文件。"""
     suffix = Path(filename).suffix.lower()
@@ -136,23 +123,35 @@ def create_app(prefix="", test_config=None):
     app = Flask(__name__)
     bp = Blueprint("exp", __name__)
     instance = Path(app.instance_path)
+    # 统一账号：secret_key 与 forest_web.db 都复用 forest-data，同域共享 session cookie
+    forest_secret, forest_db = auth.forest_settings(instance)
     app.config.from_mapping(
         DATABASE=str(instance / "survey.sqlite3"),
         UPLOAD_DIR=str(instance / "uploads"),
         PHOTO_DIR=str(instance / "photos"),
         BACKUP_DIR=str(instance / "backups"),
         MAX_CONTENT_LENGTH=36 * 1024 * 1024,
+        SECRET_KEY=forest_secret,
+        FOREST_DB=forest_db,
+        LOCAL_DEV_USER=os.environ.get("EXP_LOCAL_USER", ""),
+        # 只读 forest-data 的登录态：cookie 必须落在根路径，并且不允许本应用续期/改写
+        # session（否则会写出 Path=/exp-survey 的同名 cookie，遮蔽 forest-data 那条）
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_PATH="/",
+        SESSION_REFRESH_EACH_REQUEST=False,
         PERMANENT_SESSION_LIFETIME=30 * 24 * 3600,
-        SECRET_KEY=_secret_key(instance),
     )
     if test_config:
         app.config.update(test_config)
     if prefix:
-        # 网关已剥前缀，这里只限定 cookie 作用域与 https
-        app.config["APPLICATION_ROOT"] = prefix
+        # 只限定 https；刻意不设 APPLICATION_ROOT —— 它会让 Flask 把 session cookie
+        # 写到 Path=/exp-survey，与 forest-data 的 Path=/ 同名遮蔽（hqz-survey H9）
         app.config["SESSION_COOKIE_SECURE"] = True
         app.config["PREFERRED_URL_SCHEME"] = "https"
+    if not forest_db:
+        app.logger.warning(
+            "未找到 forest-data 的 forest_web.db；登录态无法校验（本地可用 EXP_LOCAL_USER 免登录）"
+        )
     for key in ("UPLOAD_DIR", "PHOTO_DIR", "BACKUP_DIR"):
         Path(app.config[key]).mkdir(parents=True, exist_ok=True)
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
@@ -178,12 +177,6 @@ def create_app(prefix="", test_config=None):
             if column not in columns:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         db.commit()
-        username, default_pwd, created = auth.ensure_users(db)
-        if created:
-            app.logger.warning(
-                "首次启动已创建管理员 %s%s；请登录 /admin/ 立即修改密码",
-                username, "（仍使用默认密码 admin123）" if default_pwd else "",
-            )
 
     with app.app_context():
         init_db()
@@ -273,68 +266,37 @@ def create_app(prefix="", test_config=None):
 
     # ── 页面 ──────────────────────────────────────────────────
     @bp.get("/")
+    @auth.login_required
     def index():
         return render_template("index.html", base=prefix)
 
     @bp.get("/admin/")
+    @auth.admin_required
     def admin_page():
-        user = auth.current_user(get_db())
-        if user is None:
-            return redirect(f"{prefix}/?next=admin")
-        if not auth.is_admin(user):
-            return redirect(f"{prefix}/")
+        user = auth.current_user()
         return render_template("admin.html", base=prefix, user=user["username"],
-                               is_owner=bool(user["is_owner"]))
+                               is_admin=auth.is_admin(user))
 
-    # ── 认证 ──────────────────────────────────────────────────
+    # ── 认证（登录/改密都在 forest-data，这里只读登录态）──────
     @bp.get("/api/me")
     def api_me():
-        user = auth.current_user(get_db())
+        user = auth.current_user()
         if user is None:
-            return jsonify(user=None)
-        return jsonify(user=user["username"], role=user["role"],
-                       is_owner=bool(user["is_owner"]))
-
-    @bp.post("/api/login")
-    def api_login():
-        data = request.get_json(silent=True) or {}
-        username = (data.get("username") or "").strip()
-        db = get_db()
-        user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if not auth.verify_password(user, data.get("password")):
-            return jsonify(error="用户名或密码错误"), 401
-        session.permanent = True
-        session["user"] = user["username"]
-        session["role"] = user["role"]
-        return jsonify(ok=True, user=user["username"], role=user["role"],
-                       is_owner=bool(user["is_owner"]))
+            return jsonify(user=None, login_url=auth.login_url())
+        return jsonify(user=user["username"], display_name=user["display_name"],
+                       role=user["role"], is_admin=bool(user["is_admin"]),
+                       login_url=auth.login_url(), logout_url=auth.logout_url())
 
     @bp.post("/api/logout")
     def api_logout():
-        session.clear()
-        return jsonify(ok=True)
+        # 不碰 session：清 cookie 由 forest-data 的 /forest/logout 统一做，
+        # 本应用只回地址，避免写出 Path=/exp-survey 的同名 cookie
+        return jsonify(ok=True, logout_url=auth.logout_url())
 
-    @bp.post("/api/password")
-    @auth.login_required(lambda: get_db())
-    def api_password():
-        data = request.get_json(silent=True) or {}
-        new_pwd = data.get("new_password") or ""
-        error = auth.password_error(new_pwd)
-        if error:
-            return jsonify(error=error), 400
-        db = get_db()
-        user = auth.current_user(db)
-        if not auth.verify_password(user, data.get("old_password")):
-            return jsonify(error="原密码不正确"), 400
-        with db:
-            db.execute("UPDATE users SET password_hash=?, pwd_ver=pwd_ver+1 WHERE id=?",
-                       (auth.hash_password(new_pwd), user["id"]))
-        session.clear()
-        return jsonify(ok=True)
 
     # ── App 接口 ──────────────────────────────────────────────
     @bp.get("/api/projects")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def projects():
         rows = get_db().execute(
             "SELECT * FROM projects WHERE COALESCE(is_active, 1)=1 ORDER BY uploaded_at DESC"
@@ -342,12 +304,12 @@ def create_app(prefix="", test_config=None):
         return jsonify({"projects": [project_json(row) for row in rows]})
 
     @bp.post("/api/projects")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def upload_gone():
         return jsonify(error="上传已迁移到管理员后台 /admin/，请让管理员操作"), 403
 
     @bp.get("/api/projects/<project_id>")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def project_detail(project_id):
         project = get_db().execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if project is None:
@@ -360,7 +322,7 @@ def create_app(prefix="", test_config=None):
         return jsonify(result)
 
     @bp.get("/api/subcompartments/<int:sub_id>")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def subcompartment_detail(sub_id):
         return jsonify(sub_detail(get_subcompartment(sub_id)))
 
@@ -382,7 +344,7 @@ def create_app(prefix="", test_config=None):
         return result
 
     @bp.put("/api/subcompartments/<int:sub_id>/survey")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def save_survey(sub_id):
         row = get_subcompartment(sub_id)
         payload = request.get_json(silent=True)
@@ -425,7 +387,7 @@ def create_app(prefix="", test_config=None):
         return jsonify({"survey": survey, "summary": summary})
 
     @bp.post("/api/subcompartments/<int:sub_id>/photos")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def upload_photo(sub_id):
         get_subcompartment(sub_id)
         upload = request.files.get("file")
@@ -460,7 +422,7 @@ def create_app(prefix="", test_config=None):
         }), 201
 
     @bp.get("/photos/<int:photo_id>")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def photo_file(photo_id):
         photo = get_db().execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
         if photo is None:
@@ -468,7 +430,7 @@ def create_app(prefix="", test_config=None):
         return send_file(Path(app.config["PHOTO_DIR"]) / photo["filename"], mimetype="image/jpeg")
 
     @bp.put("/api/subcompartments/<int:sub_id>/track")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def save_track(sub_id):
         row = get_subcompartment(sub_id)
         if not params_of(row)["has_track"]:
@@ -503,7 +465,7 @@ def create_app(prefix="", test_config=None):
         return jsonify({"points": cleaned, "distance": haversine_distance(cleaned)})
 
     @bp.get("/api/subcompartments/<int:sub_id>/track.gpx")
-    @auth.login_required(lambda: get_db())
+    @auth.login_required
     def export_track(sub_id):
         row = get_subcompartment(sub_id)
         points = json.loads(row["track_json"])
@@ -569,9 +531,9 @@ def create_app(prefix="", test_config=None):
         return project_id
 
     @bp.get("/admin/api/projects")
-    @auth.admin_required(lambda: get_db())
+    @auth.admin_required
     def admin_projects():
-        user = auth.current_user(get_db())
+        user = auth.current_user()
         rows = get_db().execute("SELECT * FROM projects ORDER BY uploaded_at DESC").fetchall()
         return jsonify(projects=[{
             **project_json(row),
@@ -579,12 +541,12 @@ def create_app(prefix="", test_config=None):
         } for row in rows])
 
     @bp.post("/admin/api/projects")
-    @auth.admin_required(lambda: get_db())
+    @auth.admin_required
     def admin_upload():
         filename, blob = parse_upload(request.files.get("file"))
         parsed = parse_blob(filename, blob)
         stored_name, _path = store_blob(filename, blob)
-        user = auth.current_user(get_db())
+        user = auth.current_user()
         project_id = insert_project(filename, stored_name, parsed, user["username"])
         row = get_db().execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         return jsonify(ok=True, project=project_json(row)), 201
@@ -680,17 +642,17 @@ def create_app(prefix="", test_config=None):
         return name
 
     @bp.post("/admin/api/projects/<project_id>/update")
-    @auth.admin_required(lambda: get_db())
+    @auth.admin_required
     def admin_update(project_id):
         db = get_db()
         project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if project is None:
             raise WorkbookError("项目不存在")
-        user = auth.current_user(db)
+        user = auth.current_user()
         if not auth.can_overwrite(user, project["uploader"]):
             return jsonify(error=(
                 f"该项目由「{project['uploader'] or '未知'}」上传，"
-                "只有上传人本人或超级管理员可以覆盖"
+                "只有上传人本人或管理员可以覆盖"
             )), 403
 
         filename, blob = parse_upload(request.files.get("file"))
@@ -718,7 +680,7 @@ def create_app(prefix="", test_config=None):
         return jsonify(ok=True, preview=preview, project=project_json(row), backup=backup)
 
     @bp.get("/admin/api/projects/<project_id>/source")
-    @auth.admin_required(lambda: get_db())
+    @auth.admin_required
     def admin_source(project_id):
         db = get_db()
         project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -728,64 +690,6 @@ def create_app(prefix="", test_config=None):
         if not path.is_file():
             raise WorkbookError("源文件已丢失")
         return send_file(path, as_attachment=True, download_name=project["filename"])
-
-    @bp.get("/admin/api/users")
-    @auth.admin_required(lambda: get_db())
-    def admin_users():
-        rows = get_db().execute(
-            "SELECT id, username, role, is_owner, created_at FROM users ORDER BY id"
-        ).fetchall()
-        return jsonify(users=[{key: row[key] for key in row.keys()} for row in rows])
-
-    @bp.post("/admin/api/users")
-    @auth.admin_required(lambda: get_db())
-    def admin_create_user():
-        data = request.get_json(silent=True) or {}
-        username = (data.get("username") or "").strip()
-        password = data.get("password") or ""
-        role = data.get("role") or "user"
-        is_owner = bool(data.get("is_owner"))
-        if not username or len(username) > 30:
-            return jsonify(error="用户名必填且不超过 30 字"), 400
-        if role not in ("admin", "user"):
-            return jsonify(error="角色只能是 admin 或 user"), 400
-        error = auth.password_error(password)
-        if error:
-            return jsonify(error=error), 400
-        db = get_db()
-        me = auth.current_user(db)
-        if is_owner and not me["is_owner"]:
-            return jsonify(error="只有超级管理员可以设置超级管理员"), 403
-        if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            return jsonify(error="用户名已存在"), 400
-        with db:
-            db.execute(
-                "INSERT INTO users(username, password_hash, role, is_owner, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (username, auth.hash_password(password), role, int(is_owner),
-                 datetime.now().strftime("%Y-%m-%d %H:%M")),
-            )
-        return jsonify(ok=True), 201
-
-    @bp.post("/admin/api/users/<path:username>/password")
-    @auth.admin_required(lambda: get_db())
-    def admin_reset_password(username):
-        data = request.get_json(silent=True) or {}
-        password = data.get("password") or ""
-        error = auth.password_error(password)
-        if error:
-            return jsonify(error=error), 400
-        db = get_db()
-        target = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if target is None:
-            raise WorkbookError("用户不存在")
-        me = auth.current_user(db)
-        if target["is_owner"] and not me["is_owner"]:
-            return jsonify(error="只有超级管理员可以修改超级管理员密码"), 403
-        with db:
-            db.execute("UPDATE users SET password_hash=?, pwd_ver=pwd_ver+1 WHERE id=?",
-                       (auth.hash_password(password), target["id"]))
-        return jsonify(ok=True)
 
     # ── 错误处理 ──────────────────────────────────────────────
     @app.errorhandler(WorkbookError)
@@ -801,6 +705,11 @@ def create_app(prefix="", test_config=None):
         # 发版后必须拿新页面；静态资源（带版本查询串）不受影响
         if response.mimetype == "text/html":
             response.headers["Cache-Control"] = "no-cache"
+        # 清历史残留：v1.1 及以前把 session cookie 写在 Path=/exp-survey，与 forest-data
+        # 的 Path=/ 同名。浏览器"最长路径优先"→ 登出不掉、换账号串号（hqz-survey H9）。
+        if prefix:
+            response.delete_cookie("session", path=prefix,
+                                   secure=True, samesite="Lax")
         return response
 
     app.register_blueprint(bp)

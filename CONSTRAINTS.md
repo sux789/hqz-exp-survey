@@ -20,6 +20,7 @@
 | C13 | 材积公式以每个上传工作簿的样地表为直接依据：提取固定胸径、a/b/c、取整位数、采伐公式和每公顷系数；未知树种不得静默套用其他树种参数 | 应用 v1.0 | — |
 | C14 | **上传/覆盖只走 `/admin/`**：所有 `/admin/api/*` 必须 `@admin_required`；覆盖必须服务端校验 `uploader == 当前用户 或 is_owner`，且 `confirm` 等于当前项目文件名——前端确认不算数。App 端 `POST /api/projects` 永久返回 403 指向后台 | 应用 v1.1 | 反转 v1.0「任意访问者可上传」 |
 | C15 | **程序参数 sheet 是配置，不是数据**：第一个 sheet 永远是基础数据（C12），参数表若在第一位必须明确报错；未知 key / 重复 key / 全角分隔符 / 非法取值 / 越界数值 / 隐藏列不在表头，全部带 Excel 行号报错；**无参数表时行为必须等于 v1.0 默认值** | 应用 v1.1 | — |
+| C16 | **登录态只读 forest-data**：`SECRET_KEY` 必须取自 `forest-data/web/.secret_key`，`SESSION_COOKIE_PATH` 必须 `"/"`，**禁止**设 `APPLICATION_ROOT`、**禁止**在本应用写 session（含 `session.clear()`）；页面与接口跳转一律用 `request.script_root`，禁止硬编码 `/`。原因：cookie 写 `Path=/exp-survey` 会与门户 `Path=/` 同名遮蔽 → 登出不掉、换账号串号（hqz-survey 2026-08-24 修复，H9）；硬编码 `/` 在网关下会跳回 gateway 首页。守卫：`tests/test_app.GatewayMountTests`（cookie 路径 + next 前缀 + 只读取用户） | 应用 v1.2 | 反转 v1.1「`APPLICATION_ROOT=prefix` 用于限定 cookie 与 https」 |
 
 <!-- C 编号用于 STATE.md 的「活跃约束」区间，`bash tools/run.sh --status` 会自动读取。
      守卫归属：C01 由 selftest 的「shell 变量写法扫描」断言守住；C02 由 .gitignore 与 README 守住；

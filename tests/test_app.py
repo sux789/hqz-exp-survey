@@ -1,6 +1,7 @@
 import io
 import json
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,31 @@ from workbook import WorkbookError, parse_workbook
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "data" / "中幼林抚育林木采伐调查设计总表.xlsx"
+
+FOREST_SCHEMA = """
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    password_hash TEXT,
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    expires_at TEXT,
+    created_at TEXT
+);
+"""
+
+
+def make_forest_db(path, users):
+    """建一个最小 forest_web.db：只保留鉴权要用的 users 表。"""
+    conn = sqlite3.connect(path)
+    conn.executescript(FOREST_SCHEMA)
+    conn.executemany(
+        "INSERT INTO users(id, username, display_name, is_admin, is_active, expires_at)"
+        " VALUES(?,?,?,?,?,?)", users,
+    )
+    conn.commit()
+    conn.close()
 
 
 def workbook_with_params(rows, name="带参数.xlsx"):
@@ -107,24 +133,39 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        forest_db = root / "forest_web.db"
+        make_forest_db(forest_db, [
+            (1, "admin", "管理员甲", 1, 1, None),
+            (2, "worker", "调查员", 0, 1, None),
+            (3, "admin2", "管理员乙", 1, 1, None),
+            (4, "expired", "过期账号", 1, 1, "2020-01-01"),
+            (5, "disabled", "停用账号", 1, 0, None),
+        ])
         self.app = create_app(test_config={
             "TESTING": True,
             "DATABASE": str(root / "test.sqlite3"),
             "UPLOAD_DIR": str(root / "uploads"),
             "PHOTO_DIR": str(root / "photos"),
             "BACKUP_DIR": str(root / "backups"),
+            "SECRET_KEY": "test-secret",
+            "FOREST_DB": str(forest_db),
+            "LOCAL_DEV_USER": "",
         })
         self.client = self.app.test_client()
-        self.login("admin", "admin123")
+        self.login(1)
         self.project = self.upload(SAMPLE.name, SAMPLE.read_bytes())
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def login(self, username, password):
-        response = self.client.post("/api/login", json={"username": username, "password": password})
-        self.assertEqual(response.status_code, 200, response.get_json())
-        return response.get_json()
+    def login(self, user_id):
+        """模拟 forest-data 登录成功后写入的 session（本应用只读不改）。"""
+        with self.client.session_transaction() as session:
+            session["user_id"] = user_id
+
+    def logout(self):
+        with self.client.session_transaction() as session:
+            session.clear()
 
     def upload(self, filename, blob):
         response = self.client.post("/admin/api/projects", data={
@@ -137,12 +178,60 @@ class ApiTests(unittest.TestCase):
         project = self.client.get(f"/api/projects/{self.project['id']}").get_json()
         return project["subcompartments"][0]["id"]
 
-    # ── 鉴权 ────────────────────────────────────────────────
-    def test_anonymous_cannot_read_projects(self):
-        self.client.post("/api/logout")
+    # ── 鉴权（账号在 forest-data）────────────────────────────
+    def test_anonymous_is_sent_to_unified_login(self):
+        self.logout()
         response = self.client.get("/api/projects")
         self.assertEqual(response.status_code, 401)
+        self.assertIn("/forest/login", response.get_json()["login_url"])
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 302)
+        self.assertIn("/forest/login?next=/", page.headers["Location"])
 
+    def test_me_exposes_login_and_logout_url(self):
+        me = self.client.get("/api/me").get_json()
+        self.assertEqual(me["user"], "admin")
+        self.assertEqual(me["role"], "admin")
+        self.assertIn("/forest/login", me["login_url"])
+        self.assertEqual(me["logout_url"], "/forest/logout")
+
+    def test_disabled_and_expired_accounts_are_rejected(self):
+        self.logout()
+        for user_id in (4, 5):
+            with self.subTest(user_id=user_id):
+                self.login(user_id)
+                self.assertEqual(self.client.get("/api/projects").status_code, 401)
+        # 不存在的 user_id 同样拒绝（账号被删）
+        self.login(999)
+        self.assertEqual(self.client.get("/api/projects").status_code, 401)
+
+    def test_plain_user_cannot_enter_admin(self):
+        self.logout()
+        self.login(2)
+        self.assertEqual(self.client.get("/admin/api/projects").status_code, 403)
+        self.assertEqual(self.client.get("/admin/").status_code, 302)
+        # 调查接口仍然可用
+        self.assertEqual(self.client.get("/api/projects").status_code, 200)
+
+    def test_admin_role_comes_from_forest_users_table(self):
+        self.logout()
+        self.login(3)
+        response = self.client.get("/admin/api/projects")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["projects"][0]["can_overwrite"])
+
+    def test_admin_can_overwrite_other_uploader(self):
+        self.logout()
+        self.login(3)
+        response = self.client.post(
+            f"/admin/api/projects/{self.project['id']}/update?dry=1",
+            data={"file": (io.BytesIO(SAMPLE.read_bytes()), SAMPLE.name)},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["preview"]["matched"], 684)
+
+    # ── 数据 ────────────────────────────────────────────────
     def test_upload_is_moved_to_admin(self):
         response = self.client.post("/api/projects", data={
             "file": (io.BytesIO(SAMPLE.read_bytes()), SAMPLE.name),
@@ -150,42 +239,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("/admin/", response.get_json()["error"])
 
-    def test_plain_user_cannot_enter_admin(self):
-        self.client.post("/admin/api/users", json={
-            "username": "worker", "password": "worker123", "role": "user",
-        })
-        self.client.post("/api/logout")
-        self.login("worker", "worker123")
-        self.assertEqual(self.client.get("/admin/api/projects").status_code, 403)
-        self.assertEqual(self.client.get("/admin/").status_code, 302)
-        # 调查接口仍然可用
-        self.assertEqual(self.client.get("/api/projects").status_code, 200)
-
-    def test_only_uploader_or_owner_can_overwrite(self):
-        self.client.post("/admin/api/users", json={
-            "username": "other", "password": "other123", "role": "admin",
-        })
-        self.client.post("/api/logout")
-        self.login("other", "other123")
-        response = self.client.post(
-            f"/admin/api/projects/{self.project['id']}/update?dry=1",
-            data={"file": (io.BytesIO(SAMPLE.read_bytes()), SAMPLE.name)},
-            content_type="multipart/form-data",
-        )
-        self.assertEqual(response.status_code, 403)
-        self.assertIn("上传人", response.get_json()["error"])
-
-        # 超管可以覆盖他人项目（admin 是播种的超管）
-        self.client.post("/api/logout")
-        self.login("admin", "admin123")
-        response = self.client.post(
-            f"/admin/api/projects/{self.project['id']}/update?dry=1",
-            data={"file": (io.BytesIO(SAMPLE.read_bytes()), SAMPLE.name)},
-            content_type="multipart/form-data",
-        )
-        self.assertEqual(response.status_code, 200)
-
-    # ── 数据 ────────────────────────────────────────────────
     def test_project_uses_original_filename(self):
         response = self.client.get("/api/projects")
         self.assertEqual(response.get_json()["projects"][0]["filename"], SAMPLE.name)
@@ -295,6 +348,53 @@ class ApiTests(unittest.TestCase):
         response = self.client.put(f"/api/subcompartments/{sub_id}/track", json={"points": []})
         self.assertEqual(response.status_code, 400)
         self.assertIn("关闭轨迹", response.get_json()["error"])
+
+
+class GatewayMountTests(unittest.TestCase):
+    """网关前缀挂载的回归：H9（cookie 路径）与"跳转丢前缀"两条都只会在线上炸。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        forest_db = root / "forest_web.db"
+        make_forest_db(forest_db, [(1, "admin", "管理员甲", 1, 1, None)])
+        self.root = root
+        self.forest_db = forest_db
+        self.app = create_app(prefix="/exp-survey", test_config={
+            "TESTING": True,
+            "DATABASE": str(root / "test.sqlite3"),
+            "UPLOAD_DIR": str(root / "uploads"),
+            "PHOTO_DIR": str(root / "photos"),
+            "BACKUP_DIR": str(root / "backups"),
+            "SECRET_KEY": "test-secret",
+            "FOREST_DB": str(forest_db),
+            "LOCAL_DEV_USER": "",
+        })
+        self.client = self.app.test_client()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_session_cookie_is_never_scoped_to_prefix(self):
+        self.assertEqual(self.app.config["SESSION_COOKIE_PATH"], "/")
+        response = self.client.get("/api/me")
+        for cookie in response.headers.getlist("Set-Cookie"):
+            # 只允许删除历史残留，不允许写一条带值的 /exp-survey cookie
+            if "Path=/exp-survey" in cookie:
+                self.assertIn("Expires=Thu, 01 Jan 1970", cookie)
+
+    def test_login_redirect_keeps_gateway_prefix(self):
+        response = self.client.get("/", environ_overrides={"SCRIPT_NAME": "/exp-survey"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"],
+                         "/forest/login?next=/exp-survey/")
+
+    def test_login_user_is_read_from_forest_db(self):
+        with self.client.session_transaction() as session:
+            session["user_id"] = 1
+        me = self.client.get("/api/me", environ_overrides={"SCRIPT_NAME": "/exp-survey"}).get_json()
+        self.assertEqual(me["user"], "admin")
+        self.assertEqual(me["login_url"], "/forest/login?next=/exp-survey/")
 
 
 if __name__ == "__main__":

@@ -8,10 +8,10 @@ Excel 驱动的中幼林样地调查 App：管理员在 `/admin/` 上传调查�
 
 ## 账号与权限
 
-- 首次启动自动建超管：环境变量 `EXP_ADMIN_USER` / `EXP_ADMIN_PASSWORD`，缺省 `admin` / `admin123`（**生产必须覆盖并立即改密**）。
-- `admin` 才能进 `/admin/` 上传与覆盖；`user` 只能调查。
-- 覆盖已有项目：**上传人本人或超级管理员**，且要照原样输入当前项目文件名。
-- 覆盖按小班号对齐，就地更新基础数据；已填调查、照片、轨迹全部保留；写库前自动备份到 `instance/backups/`。
+- **统一账号**：使用森林门户 <https://forest.bibook.top/forest/login> 的用户体系（`forest-data/web/forest_web.db`）。本应用不自建账号，只读门户登录后的 `session["user_id"]`。
+- `is_admin=1` 才能进 `/admin/` 上传与覆盖，并且可覆盖任何人上传的项目；普通用户只能做调查。
+- 覆盖已有项目：需照原样输入当前项目文件名；覆盖按小班号对齐，就地更新基础数据，已填调查、照片、轨迹全部保留；写库前自动备份到 `instance/backups/`。
+- 本地调试：`EXP_LOCAL_USER=张三 /usr/bin/python3 main.py` 可免登录（等同管理员）；不设则跳门户登录。
 
 ## Excel 约定
 
@@ -35,7 +35,7 @@ Excel 驱动的中幼林样地调查 App：管理员在 `/admin/` 上传调查�
 ```bash
 /usr/bin/python3 -m pip install -r requirements.txt
 /usr/bin/python3 main.py
-/usr/bin/python3 -m unittest discover -s tests -v          # 16 项
+/usr/bin/python3 -m unittest discover -s tests -v          # 22 项
 PYTHON=/usr/bin/python3 bash tools/run.sh --out out/ --data data/中幼林抚育林木采伐调查设计总表.xlsx --json
 ```
 
@@ -43,8 +43,10 @@ PYTHON=/usr/bin/python3 bash tools/run.sh --out out/ --data data/中幼林抚育
 
 ```bash
 INSTALL=1 bash deploy.sh     # 首次：装依赖 + 同步 + appspec + 登记 + 重启 gateway
-bash deploy.sh               # 日常
+bash deploy.sh               # 日常（先预检 forest-data 的 .secret_key / forest_web.db 可读）
 ```
+
+部署后匿名访问 `GET /exp-survey/` 应 302 到 `/forest/login?next=/exp-survey/`，否则先查 secret_key 是否与 portal 同一把。
 
 App 出包：推 `v*` tag → GitHub Actions 构建签名 APK 并发布 Releases（需 4 个 Secret：`KEYSTORE_BASE64` / `KEY_ALIAS` / `KEYSTORE_PASSWORD` / `KEY_PASSWORD`）；推送 `android/**` 只出 debug 包。
 

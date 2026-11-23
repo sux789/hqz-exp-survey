@@ -108,15 +108,12 @@
   </main>
 
   <div id="loginMask" class="login-mask hidden">
-    <form id="loginForm" class="login-card">
+    <div class="login-card">
       <span class="brand-mark large">林</span>
-      <h1>中幼林抚育调查</h1>
-      <p>请使用管理员分配的账号登录。</p>
-      <label>用户名<input id="loginUser" type="text" autocomplete="username" required></label>
-      <label>密码<input id="loginPwd" type="password" autocomplete="current-password" required></label>
-      <p id="loginError" class="login-error"></p>
-      <button class="button primary wide" type="submit">登录</button>
-    </form>
+      <h1>需要登录</h1>
+      <p>本应用使用森林门户统一账号，请登录后继续。</p>
+      <a id="loginLink" class="button primary wide" href="/forest/login">去登录</a>
+    </div>
   </div>
 
   <div id="toast" class="toast hidden" role="status"></div>
