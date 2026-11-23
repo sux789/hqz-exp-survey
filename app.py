@@ -15,10 +15,34 @@ from flask import (
 )
 from werkzeug.exceptions import RequestEntityTooLarge
 
-import auth
-from calculations import calculate_summary, haversine_distance
-from param_parser import default_params, public_params
-from workbook import WorkbookError, parse_workbook
+# ── gateway 共存：依赖模块命名空间隔离 ──────────────────────
+# gateway 用 importlib 按绝对路径加载各 app，纯裸 `import auth` 会注册到公共
+# sys.modules["auth"]，与 forest-data 的同名模块冲突（它要 init_auth 等接口）。
+# 这里把本 app 的 4 个本地依赖以唯一前缀注册，避免污染公共命名空间。
+import sys as _sys
+import importlib.util as _ilu
+_LOCAL_DIR = Path(__file__).resolve().parent
+_PREFIX = "expsurvey_"
+
+def _local_module(_name):
+    _full = _PREFIX + _name
+    if _full not in _sys.modules:
+        _spec = _ilu.spec_from_file_location(_full, str(_LOCAL_DIR / f"{_name}.py"))
+        _mod = _ilu.module_from_spec(_spec)
+        _sys.modules[_full] = _mod
+        _spec.loader.exec_module(_mod)
+    return _sys.modules[_full]
+
+auth = _local_module("auth")
+_calc = _local_module("calculations")
+_pp = _local_module("param_parser")
+_workbook = _local_module("workbook")
+calculate_summary = _calc.calculate_summary
+haversine_distance = _calc.haversine_distance
+default_params = _pp.default_params
+public_params = _pp.public_params
+WorkbookError = _workbook.WorkbookError
+parse_workbook = _workbook.parse_workbook
 
 # gateway 约定：create_app(prefix='/exp-survey')，DispatcherMiddleware 已剥前缀并设 SCRIPT_NAME，
 # 所以路由**不挂** url_prefix（否则双重前缀 404）；prefix 只用于页面 base 与 cookie 限定。
