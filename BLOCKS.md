@@ -10,5 +10,11 @@
 | B4 | 项目、筛选、调查网格、照片与卫星轨迹交互 | static/app.js | B3 API | 浏览器界面 | Leaflet |
 | B5 | 页面结构与移动优先样式 | `templates/index.html` `static/style.css` | B4 渲染 | 页面与布局 | — |
 | B6 | 单元测试和真实浏览器冒烟验证 | `tests/test_app.py` `tools/ui_smoke.mjs` | 真实工作簿/本地应用 | 测试断言与截图 | B1–B5 |
+| B7 | 用户、会话与覆盖权限 | auth.py | 用户名/角色/上传人 | 登录态与 403 判定 | SQLite |
+| B8 | 「程序参数」sheet 解析与校验 | param_parser.py | 参数表六列 | 功能/压缩/隐藏列配置 | openpyxl |
+| B9 | 管理员后台（上传、预检覆盖、用户） | `templates/admin.html` `static/admin.js` | B3 API | 后台界面 | B3、B7、B8 |
+| B10 | gateway 部署与 APK 打包 | `deploy/` `deploy.sh` `android/` `.github/workflows/` | 源码 | 线上挂载 + APK | — |
+
+> 契约补充：B7 覆盖判定必须在后端（前端 disabled 只影响体验）；B8 报错必须带 Excel 行号且默认值等于 v1.0；B10 的 App 是远程 URL 壳，改网页不必重新出包。
 
 > 契约：B1 对坏数据抛出带 Excel 行号的 WorkbookError；B2 单株和径阶材积按源表位数取整；B3 不返回服务器文件路径；B4 修改后自动保存；B6 使用隔离测试数据库与 Chrome 配置。

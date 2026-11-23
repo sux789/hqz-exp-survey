@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#24543b">
+  <meta name="exp-base" content="{{ base }}">
   <title>中幼林抚育调查</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
@@ -17,22 +18,20 @@
     </div>
     <span class="spacer"></span>
     <span id="saveStatus" class="save-status hidden"></span>
+    <span id="currentUser" class="current-user hidden"></span>
+    <a id="adminLink" class="top-link hidden" href="admin/">管理</a>
+    <button id="logoutButton" class="top-link hidden" type="button">退出</button>
   </header>
 
   <main>
     <section id="projectsView" class="page narrow">
       <div class="page-heading">
-        <div><p class="eyebrow">FIELD SURVEY</p><h1>调查项目</h1><p>上传调查设计总表，开始样地调查。</p></div>
+        <div><p class="eyebrow">FIELD SURVEY</p><h1>调查项目</h1><p>选择已下发的调查设计总表，开始样地调查。</p></div>
         <span class="count-badge" id="projectCount">0 个项目</span>
       </div>
-      <label id="uploadZone" class="upload-zone" for="projectFile">
-        <input id="projectFile" type="file" accept=".xlsx,.xlsm" hidden>
-        <span class="upload-icon">↑</span>
-        <strong>上传调查设计总表</strong>
-        <span>点击选择或拖入 Excel 文件，第一个 sheet 将作为调查基础数据</span>
-        <span class="upload-button">选择文件</span>
-      </label>
-      <div id="uploadProgress" class="progress-message hidden"></div>
+      <div id="adminTip" class="notice-card hidden">
+        调查项目由管理员统一上传与更新，如需新增或覆盖文件请到 <a href="admin/">管理后台</a>。
+      </div>
       <div class="section-heading"><h2>项目文件</h2><span>文件名即项目名称</span></div>
       <div id="projectList" class="project-list"></div>
     </section>
@@ -53,7 +52,7 @@
       </div>
       <div class="table-card">
         <table class="data-table">
-          <thead><tr><th>小班号</th><th>村委会</th><th>面积（亩）</th><th>树种组成</th><th>郁闭度</th><th>平均胸径</th><th>平均树高</th><th>采伐方式</th><th>调查状态</th></tr></thead>
+          <thead id="subcompartmentHead"></thead>
           <tbody id="subcompartmentRows"></tbody>
         </table>
         <div id="emptySubcompartments" class="empty-state hidden">没有符合当前条件的小班，请调整筛选条件。</div>
@@ -85,15 +84,15 @@
         <div class="formula-note" id="formulaNote"></div>
       </section>
 
-      <div class="tools-grid">
-        <section class="tool-card">
-          <div class="card-heading compact"><div><p class="eyebrow">FIELD PHOTOS</p><h2>样地照片</h2><p>自动等比压缩至最长边 1440px，并添加时间与定位水印。</p></div></div>
+      <div id="toolsGrid" class="tools-grid">
+        <section id="photoCard" class="tool-card">
+          <div class="card-heading compact"><div><p class="eyebrow">FIELD PHOTOS</p><h2>样地照片</h2><p id="photoHint">自动等比压缩后添加水印。</p></div></div>
           <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
           <div class="button-row"><button id="takePhoto" class="button primary" type="button">拍摄 / 选择照片</button><span id="photoStatus" class="inline-status"></span></div>
           <div id="photoList" class="photo-list"></div>
         </section>
 
-        <section class="tool-card track-card">
+        <section id="trackCard" class="tool-card track-card">
           <div class="card-heading compact"><div><p class="eyebrow">SATELLITE TRACK</p><h2>卫星轨迹</h2><p>记录 WGS-84 定位点，轨迹会保存在当前小班。</p></div><span id="trackBadge" class="track-badge">未记录</span></div>
           <div id="trackMap" class="track-map"></div>
           <div class="track-stats"><span>轨迹点 <strong id="trackPoints">0</strong></span><span>距离 <strong id="trackDistance">0.00</strong> km</span><span id="trackAccuracy">等待定位</span></div>
@@ -107,6 +106,18 @@
       </div>
     </section>
   </main>
+
+  <div id="loginMask" class="login-mask hidden">
+    <form id="loginForm" class="login-card">
+      <span class="brand-mark large">林</span>
+      <h1>中幼林抚育调查</h1>
+      <p>请使用管理员分配的账号登录。</p>
+      <label>用户名<input id="loginUser" type="text" autocomplete="username" required></label>
+      <label>密码<input id="loginPwd" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="login-error"></p>
+      <button class="button primary wide" type="submit">登录</button>
+    </form>
+  </div>
 
   <div id="toast" class="toast hidden" role="status"></div>
   <script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>

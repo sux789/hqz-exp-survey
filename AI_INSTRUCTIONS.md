@@ -72,4 +72,5 @@
 - **评审单**：`bash tools/ai.sh explain`（写 doc/review.md，提交前给人看）
 - **巡检/分诊**：`bash tools/ai.sh watch --once` → 失败出 doc/health/TRIAGE.md
 - **对齐看板**：`bash tools/align.sh --open`（生成 doc/align.html，人与 AI 以同一份对齐）
-- **部署命令**：本地运行，不执行外部部署。
+- **部署命令**：`INSTALL=1 bash deploy.sh`（首次）/ `bash deploy.sh`（日常）→ gateway 挂载 `/exp-survey`；APK 由推 `v*` tag 的 GitHub Actions 出包。
+- **权限口径**：上传与覆盖只在 `/admin/`，服务端校验 admin + 上传人本人或超管 + 项目名确认（C14）。

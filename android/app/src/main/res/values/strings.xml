@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">中幼林调查</string>
+    <string name="title_activity_main">中幼林调查</string>
+    <string name="package_name">top.bibook.expsurvey</string>
+    <string name="custom_url_scheme">top.bibook.expsurvey</string>
+</resources>

@@ -5,6 +5,8 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from param_parser import ParamError, find_param_sheet, parse_program_params
+
 
 class WorkbookError(ValueError):
     pass
@@ -135,7 +137,7 @@ def parse_base_rows(ws):
         })
     if not records:
         raise WorkbookError("第一个 sheet 没有调查基础数据")
-    return records, fields
+    return records, fields, [name for _, name in headers]
 
 
 NUMBER = r"(?:\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?|\.\d+)"
@@ -260,10 +262,20 @@ def parse_workbook(path):
         raise WorkbookError(f"无法读取 Excel：{exc}") from exc
     if not wb.worksheets:
         raise WorkbookError("工作簿没有 sheet")
-    records, fields = parse_base_rows(wb.worksheets[0])
+    first = wb.worksheets[0]
+    if find_param_sheet(wb) is first:
+        raise WorkbookError(
+            "第一个 sheet 是「程序参数」；第一个 sheet 必须是调查基础数据（C12），"
+            "请把程序参数放到后面的 sheet"
+        )
+    records, fields, headers = parse_base_rows(first)
     schema = parse_plot_schema(wb)
+    try:
+        params = parse_program_params(wb, headers)
+    except ParamError as exc:
+        raise WorkbookError(str(exc)) from exc
     available = set(schema["species"])
     missing = sorted({item["name"] for row in records for item in row["species"]} - available)
     if missing:
         raise WorkbookError(f"样地表缺少树种公式：{', '.join(missing)}")
-    return {"records": records, "fields": fields, "schema": schema}
+    return {"records": records, "fields": fields, "schema": schema, "params": params}

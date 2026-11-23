@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#24543b">
+  <meta name="exp-base" content="{{ base }}">
+  <title>调查数据管理 · 中幼林抚育调查</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">林</span>
+      <div><strong>调查数据管理</strong><small>上传与更新 Excel</small></div>
+    </div>
+    <span class="spacer"></span>
+    <span class="current-user">{{ user }}{% if is_owner %} · 超级管理员{% endif %}</span>
+    <a class="top-link" href="../">返回 App</a>
+    <button id="logoutButton" class="top-link" type="button">退出</button>
+  </header>
+
+  <main class="page wide admin-page">
+    <div class="page-heading">
+      <div><p class="eyebrow">ADMIN</p><h1>调查设计总表</h1>
+        <p>上传新文件即新建项目；覆盖更新按小班号对齐，已调查数据、照片与轨迹都会保留。</p></div>
+    </div>
+
+    <section class="admin-card">
+      <div class="card-heading">
+        <div><h2>上传新项目</h2>
+          <p>第一个 sheet 作为调查基础数据；可另加「程序参数」sheet 配置功能与照片压缩。</p></div>
+      </div>
+      <label class="drop-box" id="dropBox" for="newFile">
+        <input id="newFile" type="file" accept=".xlsx,.xlsm" hidden>
+        <strong id="newFileName">点击选择或拖入 .xlsx 文件</strong>
+        <span>解析失败会带 Excel 行号提示，不会静默跳过</span>
+      </label>
+      <div class="button-row">
+        <button id="uploadBtn" class="button primary" type="button" disabled>上传并解析</button>
+        <span id="uploadMsg" class="inline-status"></span>
+      </div>
+    </section>
+
+    <section class="admin-card">
+      <div class="card-heading">
+        <div><h2>已有项目</h2><p>只有上传人本人或超级管理员可以覆盖；其余人只能查看与下载源文件。</p></div>
+        <span class="count-badge" id="projectCount">0 个</span>
+      </div>
+      <div class="table-scroll">
+        <table class="data-table admin-table">
+          <thead><tr><th>项目文件</th><th>小班</th><th>程序参数</th><th>上传人</th><th>上传时间</th><th>操作</th></tr></thead>
+          <tbody id="projectRows"></tbody>
+        </table>
+      </div>
+      <div id="emptyProjects" class="empty-state hidden">还没有项目，先上传一份调查设计总表。</div>
+    </section>
+
+    <section class="admin-card">
+      <div class="card-heading">
+        <div><h2>用户</h2><p>admin 可进入本页并上传；只有超级管理员能管理其他管理员。</p></div>
+      </div>
+      <form id="userForm" class="inline-form">
+        <label>用户名<input id="newUserName" maxlength="30" required></label>
+        <label>初始密码<input id="newUserPwd" type="text" minlength="6" required></label>
+        <label>角色<select id="newUserRole"><option value="user">user（只调查）</option><option value="admin">admin（可管理）</option></select></label>
+        <label class="check-label"><input id="newUserOwner" type="checkbox"> 超级管理员</label>
+        <button class="button secondary" type="submit">添加用户</button>
+      </form>
+      <div class="table-scroll">
+        <table class="data-table admin-table">
+          <thead><tr><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody id="userRows"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="updateModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><h2>覆盖更新</h2><button id="updateClose" class="icon-button dark" type="button" aria-label="关闭">×</button></div>
+      <p class="modal-target" id="updateTarget"></p>
+      <label class="drop-box small" for="updateFile">
+        <input id="updateFile" type="file" accept=".xlsx,.xlsm" hidden>
+        <strong id="updateFileName">选择新的 Excel 文件</strong>
+        <span>先预检，再输入项目文件名确认</span>
+      </label>
+      <div class="button-row"><button id="previewBtn" class="button primary" type="button" disabled>1. 预检</button><span id="updateMsg" class="inline-status"></span></div>
+      <div id="previewBox" class="preview-box hidden"></div>
+      <div id="confirmBox" class="confirm-box hidden">
+        <label>照原样输入当前项目文件名<input id="confirmName" autocomplete="off"></label>
+        <div class="button-row">
+          <button id="submitBtn" class="button primary" type="button">2. 确认覆盖</button>
+          <span class="inline-status">写库前自动备份到 instance/backups/</span>
+        </div>
+      </div>
+      <p id="updateError" class="login-error"></p>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="{{ url_for('static', filename='admin.js') }}"></script>
+</body>
+</html>

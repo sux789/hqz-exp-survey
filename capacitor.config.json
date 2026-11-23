@@ -1,0 +1,11 @@
+{
+  "appId": "top.bibook.expsurvey",
+  "appName": "中幼林调查",
+  "webDir": "www",
+  "backgroundColor": "#24543b",
+  "server": {
+    "url": "https://forest.bibook.top/exp-survey/",
+    "allowNavigation": ["forest.bibook.top", "www.bibook.top"],
+    "cleartext": false
+  }
+}

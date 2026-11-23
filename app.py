@@ -1,29 +1,135 @@
+import io
 import json
 import math
+import os
 import sqlite3
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-from flask import Flask, Response, g, jsonify, render_template, request, send_file
+from flask import (
+    Blueprint, Flask, Response, g, jsonify, redirect, render_template, request,
+    send_file, session,
+)
 from werkzeug.exceptions import RequestEntityTooLarge
 
+import auth
 from calculations import calculate_summary, haversine_distance
+from param_parser import default_params, public_params
 from workbook import WorkbookError, parse_workbook
 
+# gateway 约定：create_app(prefix='/exp-survey')，DispatcherMiddleware 已剥前缀并设 SCRIPT_NAME，
+# 所以路由**不挂** url_prefix（否则双重前缀 404）；prefix 只用于页面 base 与 cookie 限定。
 
-def create_app(test_config=None):
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    schema_json TEXT NOT NULL,
+    uploaded_at TEXT NOT NULL,
+    uploader TEXT NOT NULL DEFAULT '',
+    params_json TEXT NOT NULL DEFAULT '{}',
+    is_active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS subcompartments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_row INTEGER NOT NULL,
+    data_json TEXT NOT NULL,
+    fields_json TEXT NOT NULL,
+    species_json TEXT NOT NULL,
+    survey_json TEXT NOT NULL DEFAULT '{}',
+    track_json TEXT NOT NULL DEFAULT '[]',
+    UNIQUE(project_id, source_row)
+);
+CREATE TABLE IF NOT EXISTS photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subcompartment_id INTEGER NOT NULL REFERENCES subcompartments(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    original_size INTEGER NOT NULL,
+    compressed_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+MIGRATIONS = (
+    ("projects", "uploader", "TEXT NOT NULL DEFAULT ''"),
+    ("projects", "params_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("projects", "is_active", "INTEGER NOT NULL DEFAULT 1"),
+)
+
+
+def _secret_key(instance_path):
+    """多 worker 必须共享同一把 key，否则 session 互踢（supervision 同款踩坑）。"""
+    env = os.environ.get("EXP_SECRET_KEY")
+    if env:
+        return env
+    path = Path(instance_path) / ".secret_key"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    key = uuid.uuid4().hex
+    path.write_text(key, encoding="utf-8")
+    return key
+
+
+def parse_blob(filename, blob):
+    """内存解析：dry 预览不落盘、不产生垃圾文件。"""
+    suffix = Path(filename).suffix.lower()
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        handle.write(blob)
+        handle.close()
+        return parse_workbook(Path(handle.name))
+    finally:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+
+
+class _EmptyPathFix:
+    """网关剥前缀后 PATH_INFO 可能为空串（GET /exp-survey），werkzeug 会 308 补斜杠，
+    Location 用 environ 的明文 scheme 拼成 http://… → Android WebView ERR_CLEARTEXT_NOT_PERMITTED。
+    空路径归一为 /，直接命中首页（supervision 同款修复）。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    def __getattr__(self, name):
+        return getattr(self.app, name)
+
+    def __call__(self, environ, start_response):
+        if environ.get("PATH_INFO", "") == "":
+            environ["PATH_INFO"] = "/"
+        return self.app(environ, start_response)
+
+
+def create_app(prefix="", test_config=None):
+    """Flask 工厂。gateway 调 create_app(prefix=apps spec['prefix'])；本地 prefix=''。"""
     app = Flask(__name__)
+    bp = Blueprint("exp", __name__)
+    instance = Path(app.instance_path)
     app.config.from_mapping(
-        DATABASE=str(Path(app.instance_path) / "survey.sqlite3"),
-        UPLOAD_DIR=str(Path(app.instance_path) / "uploads"),
-        PHOTO_DIR=str(Path(app.instance_path) / "photos"),
+        DATABASE=str(instance / "survey.sqlite3"),
+        UPLOAD_DIR=str(instance / "uploads"),
+        PHOTO_DIR=str(instance / "photos"),
+        BACKUP_DIR=str(instance / "backups"),
         MAX_CONTENT_LENGTH=36 * 1024 * 1024,
+        SESSION_COOKIE_SAMESITE="Lax",
+        PERMANENT_SESSION_LIFETIME=30 * 24 * 3600,
+        SECRET_KEY=_secret_key(instance),
     )
     if test_config:
         app.config.update(test_config)
-    for key in ("UPLOAD_DIR", "PHOTO_DIR"):
+    if prefix:
+        # 网关已剥前缀，这里只限定 cookie 作用域与 https
+        app.config["APPLICATION_ROOT"] = prefix
+        app.config["SESSION_COOKIE_SECURE"] = True
+        app.config["PREFERRED_URL_SCHEME"] = "https"
+    for key in ("UPLOAD_DIR", "PHOTO_DIR", "BACKUP_DIR"):
         Path(app.config[key]).mkdir(parents=True, exist_ok=True)
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
 
@@ -41,48 +147,48 @@ def create_app(test_config=None):
             db.close()
 
     def init_db():
-        get_db().executescript("""
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                stored_path TEXT NOT NULL,
-                schema_json TEXT NOT NULL,
-                uploaded_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS subcompartments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                source_row INTEGER NOT NULL,
-                data_json TEXT NOT NULL,
-                fields_json TEXT NOT NULL,
-                species_json TEXT NOT NULL,
-                survey_json TEXT NOT NULL DEFAULT '{}',
-                track_json TEXT NOT NULL DEFAULT '[]',
-                UNIQUE(project_id, source_row)
-            );
-            CREATE TABLE IF NOT EXISTS photos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subcompartment_id INTEGER NOT NULL REFERENCES subcompartments(id) ON DELETE CASCADE,
-                filename TEXT NOT NULL,
-                original_size INTEGER NOT NULL,
-                compressed_size INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-        """)
-        get_db().commit()
+        db = get_db()
+        db.executescript(SCHEMA)
+        for table, column, ddl in MIGRATIONS:
+            columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        db.commit()
+        username, default_pwd, created = auth.ensure_users(db)
+        if created:
+            app.logger.warning(
+                "首次启动已创建管理员 %s%s；请登录 /admin/ 立即修改密码",
+                username, "（仍使用默认密码 admin123）" if default_pwd else "",
+            )
 
     with app.app_context():
         init_db()
 
+    # ── 序列化 ────────────────────────────────────────────────
+    def params_of(row):
+        try:
+            stored = json.loads(row["params_json"] or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        return public_params({**default_params(), **stored})
+
     def project_json(row):
-        sub_count = get_db().execute(
+        db = get_db()
+        count = db.execute(
             "SELECT COUNT(*) FROM subcompartments WHERE project_id = ?", (row["id"],)
+        ).fetchone()[0]
+        photos = db.execute(
+            "SELECT COUNT(*) FROM subcompartments s JOIN photos p"
+            " ON p.subcompartment_id = s.id WHERE s.project_id = ?", (row["id"],)
         ).fetchone()[0]
         return {
             "id": row["id"],
             "filename": row["filename"],
             "uploaded_at": row["uploaded_at"],
-            "subcompartment_count": sub_count,
+            "uploader": row["uploader"] or "",
+            "subcompartment_count": count,
+            "photo_count": photos,
+            "params": params_of(row),
         }
 
     def sub_summary(row):
@@ -102,7 +208,7 @@ def create_app(test_config=None):
 
     def get_subcompartment(sub_id):
         row = get_db().execute("""
-            SELECT s.*, p.filename AS project_filename, p.schema_json
+            SELECT s.*, p.filename AS project_filename, p.schema_json, p.params_json
             FROM subcompartments s JOIN projects p ON p.id = s.project_id
             WHERE s.id = ?
         """, (sub_id,)).fetchone()
@@ -127,65 +233,97 @@ def create_app(test_config=None):
             "fields": json.loads(row["fields_json"]),
             "species": species,
             "schema": schema,
+            "params": params_of(row),
             "survey": survey,
             "summary": calculate_summary(survey, schema, [item["name"] for item in species]),
             "track": track,
             "track_distance": haversine_distance(track),
             "photos": [{
                 "id": photo["id"],
-                "url": f"/photos/{photo['id']}",
+                "url": f"photos/{photo['id']}",
                 "original_size": photo["original_size"],
                 "compressed_size": photo["compressed_size"],
                 "created_at": photo["created_at"],
             } for photo in photos],
         }
 
-    @app.get("/")
+    # ── 页面 ──────────────────────────────────────────────────
+    @bp.get("/")
     def index():
-        return render_template("index.html")
+        return render_template("index.html", base=prefix)
 
-    @app.get("/api/projects")
+    @bp.get("/admin/")
+    def admin_page():
+        user = auth.current_user(get_db())
+        if user is None:
+            return redirect(f"{prefix}/?next=admin")
+        if not auth.is_admin(user):
+            return redirect(f"{prefix}/")
+        return render_template("admin.html", base=prefix, user=user["username"],
+                               is_owner=bool(user["is_owner"]))
+
+    # ── 认证 ──────────────────────────────────────────────────
+    @bp.get("/api/me")
+    def api_me():
+        user = auth.current_user(get_db())
+        if user is None:
+            return jsonify(user=None)
+        return jsonify(user=user["username"], role=user["role"],
+                       is_owner=bool(user["is_owner"]))
+
+    @bp.post("/api/login")
+    def api_login():
+        data = request.get_json(silent=True) or {}
+        username = (data.get("username") or "").strip()
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if not auth.verify_password(user, data.get("password")):
+            return jsonify(error="用户名或密码错误"), 401
+        session.permanent = True
+        session["user"] = user["username"]
+        session["role"] = user["role"]
+        return jsonify(ok=True, user=user["username"], role=user["role"],
+                       is_owner=bool(user["is_owner"]))
+
+    @bp.post("/api/logout")
+    def api_logout():
+        session.clear()
+        return jsonify(ok=True)
+
+    @bp.post("/api/password")
+    @auth.login_required(lambda: get_db())
+    def api_password():
+        data = request.get_json(silent=True) or {}
+        new_pwd = data.get("new_password") or ""
+        error = auth.password_error(new_pwd)
+        if error:
+            return jsonify(error=error), 400
+        db = get_db()
+        user = auth.current_user(db)
+        if not auth.verify_password(user, data.get("old_password")):
+            return jsonify(error="原密码不正确"), 400
+        with db:
+            db.execute("UPDATE users SET password_hash=?, pwd_ver=pwd_ver+1 WHERE id=?",
+                       (auth.hash_password(new_pwd), user["id"]))
+        session.clear()
+        return jsonify(ok=True)
+
+    # ── App 接口 ──────────────────────────────────────────────
+    @bp.get("/api/projects")
+    @auth.login_required(lambda: get_db())
     def projects():
-        rows = get_db().execute("SELECT * FROM projects ORDER BY uploaded_at DESC").fetchall()
+        rows = get_db().execute(
+            "SELECT * FROM projects WHERE COALESCE(is_active, 1)=1 ORDER BY uploaded_at DESC"
+        ).fetchall()
         return jsonify({"projects": [project_json(row) for row in rows]})
 
-    @app.post("/api/projects")
-    def upload_project():
-        upload = request.files.get("file")
-        if upload is None or not upload.filename:
-            raise WorkbookError("请选择要上传的 Excel 文件")
-        filename = Path(upload.filename).name
-        if Path(filename).suffix.lower() not in (".xlsx", ".xlsm"):
-            raise WorkbookError("仅支持 .xlsx 或 .xlsm 文件")
-        stored_name = f"{uuid.uuid4().hex}{Path(filename).suffix.lower()}"
-        stored_path = Path(app.config["UPLOAD_DIR"]) / stored_name
-        upload.save(stored_path)
-        try:
-            parsed = parse_workbook(stored_path)
-            project_id = uuid.uuid4().hex
-            db = get_db()
-            with db:
-                db.execute(
-                    "INSERT INTO projects VALUES (?, ?, ?, ?, ?)",
-                    (project_id, filename, stored_name, json.dumps(parsed["schema"], ensure_ascii=False),
-                     datetime.now(timezone.utc).isoformat()),
-                )
-                db.executemany("""
-                    INSERT INTO subcompartments
-                    (project_id, source_row, data_json, fields_json, species_json)
-                    VALUES (?, ?, ?, ?, ?)
-                """, [(
-                    project_id, record["source_row"], json.dumps(record["data"], ensure_ascii=False),
-                    json.dumps(record["fields"], ensure_ascii=False),
-                    json.dumps(record["species"], ensure_ascii=False),
-                ) for record in parsed["records"]])
-        except Exception:
-            stored_path.unlink(missing_ok=True)
-            raise
-        row = get_db().execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-        return jsonify({"project": project_json(row)}), 201
+    @bp.post("/api/projects")
+    @auth.login_required(lambda: get_db())
+    def upload_gone():
+        return jsonify(error="上传已迁移到管理员后台 /admin/，请让管理员操作"), 403
 
-    @app.get("/api/projects/<project_id>")
+    @bp.get("/api/projects/<project_id>")
+    @auth.login_required(lambda: get_db())
     def project_detail(project_id):
         project = get_db().execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if project is None:
@@ -197,7 +335,8 @@ def create_app(test_config=None):
         result["subcompartments"] = [sub_summary(row) for row in rows]
         return jsonify(result)
 
-    @app.get("/api/subcompartments/<int:sub_id>")
+    @bp.get("/api/subcompartments/<int:sub_id>")
+    @auth.login_required(lambda: get_db())
     def subcompartment_detail(sub_id):
         return jsonify(sub_detail(get_subcompartment(sub_id)))
 
@@ -218,7 +357,8 @@ def create_app(test_config=None):
             return int(result)
         return result
 
-    @app.put("/api/subcompartments/<int:sub_id>/survey")
+    @bp.put("/api/subcompartments/<int:sub_id>/survey")
+    @auth.login_required(lambda: get_db())
     def save_survey(sub_id):
         row = get_subcompartment(sub_id)
         payload = request.get_json(silent=True)
@@ -260,7 +400,8 @@ def create_app(test_config=None):
             )
         return jsonify({"survey": survey, "summary": summary})
 
-    @app.post("/api/subcompartments/<int:sub_id>/photos")
+    @bp.post("/api/subcompartments/<int:sub_id>/photos")
+    @auth.login_required(lambda: get_db())
     def upload_photo(sub_id):
         get_subcompartment(sub_id)
         upload = request.files.get("file")
@@ -287,23 +428,27 @@ def create_app(test_config=None):
         return jsonify({
             "photo": {
                 "id": cursor.lastrowid,
-                "url": f"/photos/{cursor.lastrowid}",
+                "url": f"photos/{cursor.lastrowid}",
                 "original_size": original_size,
                 "compressed_size": len(content),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         }), 201
 
-    @app.get("/photos/<int:photo_id>")
+    @bp.get("/photos/<int:photo_id>")
+    @auth.login_required(lambda: get_db())
     def photo_file(photo_id):
         photo = get_db().execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
         if photo is None:
             raise WorkbookError("照片不存在")
         return send_file(Path(app.config["PHOTO_DIR"]) / photo["filename"], mimetype="image/jpeg")
 
-    @app.put("/api/subcompartments/<int:sub_id>/track")
+    @bp.put("/api/subcompartments/<int:sub_id>/track")
+    @auth.login_required(lambda: get_db())
     def save_track(sub_id):
-        get_subcompartment(sub_id)
+        row = get_subcompartment(sub_id)
+        if not params_of(row)["has_track"]:
+            raise WorkbookError("该项目已在「程序参数」中关闭轨迹功能")
         payload = request.get_json(silent=True)
         points = payload.get("points") if isinstance(payload, dict) else None
         if not isinstance(points, list) or len(points) > 20000:
@@ -333,7 +478,8 @@ def create_app(test_config=None):
             )
         return jsonify({"points": cleaned, "distance": haversine_distance(cleaned)})
 
-    @app.get("/api/subcompartments/<int:sub_id>/track.gpx")
+    @bp.get("/api/subcompartments/<int:sub_id>/track.gpx")
+    @auth.login_required(lambda: get_db())
     def export_track(sub_id):
         row = get_subcompartment(sub_id)
         points = json.loads(row["track_json"])
@@ -356,6 +502,268 @@ def create_app(test_config=None):
             "Content-Disposition": f"attachment; filename=track_{sub_id}.gpx"
         })
 
+    # ── 管理员后台 ────────────────────────────────────────────
+    def parse_upload(upload):
+        if upload is None or not upload.filename:
+            raise WorkbookError("请选择要上传的 Excel 文件")
+        filename = Path(upload.filename).name
+        if Path(filename).suffix.lower() not in (".xlsx", ".xlsm"):
+            raise WorkbookError("仅支持 .xlsx 或 .xlsm 文件")
+        blob = upload.read()
+        if not blob:
+            raise WorkbookError("文件为空")
+        return filename, blob
+
+    def store_blob(filename, blob):
+        ext = Path(filename).suffix.lower()
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        path = Path(app.config["UPLOAD_DIR"]) / stored_name
+        path.write_bytes(blob)
+        return stored_name, path
+
+    def insert_project(filename, stored_name, parsed, uploader):
+        project_id = uuid.uuid4().hex
+        db = get_db()
+        with db:
+            db.execute(
+                "INSERT INTO projects (id, filename, stored_path, schema_json, uploaded_at,"
+                " uploader, params_json, is_active) VALUES (?,?,?,?,?,?,?,1)",
+                (project_id, filename, stored_name,
+                 json.dumps(parsed["schema"], ensure_ascii=False),
+                 datetime.now(timezone.utc).isoformat(), uploader,
+                 json.dumps(parsed["params"], ensure_ascii=False)),
+            )
+            db.executemany("""
+                INSERT INTO subcompartments
+                (project_id, source_row, data_json, fields_json, species_json)
+                VALUES (?, ?, ?, ?, ?)
+            """, [(
+                project_id, record["source_row"], json.dumps(record["data"], ensure_ascii=False),
+                json.dumps(record["fields"], ensure_ascii=False),
+                json.dumps(record["species"], ensure_ascii=False),
+            ) for record in parsed["records"]])
+        return project_id
+
+    @bp.get("/admin/api/projects")
+    @auth.admin_required(lambda: get_db())
+    def admin_projects():
+        user = auth.current_user(get_db())
+        rows = get_db().execute("SELECT * FROM projects ORDER BY uploaded_at DESC").fetchall()
+        return jsonify(projects=[{
+            **project_json(row),
+            "can_overwrite": auth.can_overwrite(user, row["uploader"]),
+        } for row in rows])
+
+    @bp.post("/admin/api/projects")
+    @auth.admin_required(lambda: get_db())
+    def admin_upload():
+        filename, blob = parse_upload(request.files.get("file"))
+        parsed = parse_blob(filename, blob)
+        stored_name, _path = store_blob(filename, blob)
+        user = auth.current_user(get_db())
+        project_id = insert_project(filename, stored_name, parsed, user["username"])
+        row = get_db().execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        return jsonify(ok=True, project=project_json(row)), 201
+
+    def numbers_of(records):
+        return [str(record["fields"].get("number") or "").strip() for record in records]
+
+    def merge_preview(project, parsed):
+        """按小班号对齐：匹配上的更新基础数据、保留调查/轨迹/照片；新行追加；旧行不删。"""
+        numbers = numbers_of(parsed["records"])
+        empty = [index + 1 for index, number in enumerate(numbers) if not number]
+        if empty:
+            raise WorkbookError(f"新 Excel 第 {empty[0]} 条记录小班号为空")
+        seen = set()
+        duplicates = []
+        for number in numbers:
+            if number in seen and number not in duplicates:
+                duplicates.append(number)
+            seen.add(number)
+        if duplicates:
+            raise WorkbookError(f"新 Excel 小班号重复：{'、'.join(duplicates[:5])}")
+
+        db = get_db()
+        old_rows = db.execute(
+            "SELECT * FROM subcompartments WHERE project_id=? ORDER BY source_row", (project["id"],)
+        ).fetchall()
+        old_numbers = {
+            str(json.loads(row["fields_json"]).get("number") or "").strip()
+            for row in old_rows
+        }
+        new_set = set(numbers)
+        matched = [number for number in numbers if number in old_numbers]
+        added = [number for number in numbers if number not in old_numbers]
+        kept = [number for number in old_numbers if number not in new_set]
+        return {
+            "matched": len(matched),
+            "added": len(added),
+            "kept_old": len(kept),
+            "old_total": len(old_rows),
+            "new_total": len(numbers),
+            "added_numbers": added[:10],
+            "kept_numbers": sorted(kept)[:10],
+        }
+
+    def apply_merge(project, parsed, filename, stored_name):
+        db = get_db()
+        old_rows = db.execute(
+            "SELECT * FROM subcompartments WHERE project_id=? ORDER BY source_row", (project["id"],)
+        ).fetchall()
+        old_numbers = {
+            str(json.loads(row["fields_json"]).get("number") or "").strip(): row
+            for row in old_rows
+        }
+        next_row = max([row["source_row"] for row in old_rows], default=0)
+        with db:
+            for record in parsed["records"]:
+                number = str(record["fields"].get("number") or "").strip()
+                payload = (
+                    json.dumps(record["data"], ensure_ascii=False),
+                    json.dumps(record["fields"], ensure_ascii=False),
+                    json.dumps(record["species"], ensure_ascii=False),
+                )
+                old = old_numbers.get(number)
+                if old is not None:
+                    # 就地更新：id 不变 → 照片外键、调查数据、轨迹全部保住
+                    db.execute(
+                        "UPDATE subcompartments SET data_json=?, fields_json=?, species_json=?"
+                        " WHERE id=?", (*payload, old["id"]),
+                    )
+                else:
+                    next_row += 1
+                    db.execute(
+                        "INSERT INTO subcompartments (project_id, source_row, data_json,"
+                        " fields_json, species_json) VALUES (?,?,?,?,?)",
+                        (project["id"], next_row, *payload),
+                    )
+            db.execute(
+                "UPDATE projects SET filename=?, stored_path=?, schema_json=?, uploaded_at=?,"
+                " params_json=? WHERE id=?",
+                (filename, stored_name,
+                 json.dumps(parsed["schema"], ensure_ascii=False),
+                 datetime.now(timezone.utc).isoformat(),
+                 json.dumps(parsed["params"], ensure_ascii=False), project["id"]),
+            )
+
+    def backup_project(project, rows):
+        """写库前留一份快照；不提供自动回滚，文件名回给管理员便于人工核对。"""
+        name = f"{project['id']}_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        Path(app.config["BACKUP_DIR"], name).write_text(json.dumps({
+            "project": {key: project[key] for key in project.keys()},
+            "subcompartments": [{key: row[key] for key in row.keys()} for row in rows],
+        }, ensure_ascii=False), encoding="utf-8")
+        return name
+
+    @bp.post("/admin/api/projects/<project_id>/update")
+    @auth.admin_required(lambda: get_db())
+    def admin_update(project_id):
+        db = get_db()
+        project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if project is None:
+            raise WorkbookError("项目不存在")
+        user = auth.current_user(db)
+        if not auth.can_overwrite(user, project["uploader"]):
+            return jsonify(error=(
+                f"该项目由「{project['uploader'] or '未知'}」上传，"
+                "只有上传人本人或超级管理员可以覆盖"
+            )), 403
+
+        filename, blob = parse_upload(request.files.get("file"))
+        parsed = parse_blob(filename, blob)
+        preview = merge_preview(project, parsed)
+        if request.args.get("dry") == "1":
+            return jsonify(ok=True, preview=preview)
+
+        confirm = (request.form.get("confirm") or "").strip()
+        if confirm != project["filename"]:
+            return jsonify(error="确认名称不一致：请照原样输入当前项目文件名"), 400
+
+        stored_name, _path = store_blob(filename, blob)
+        old_rows = db.execute(
+            "SELECT * FROM subcompartments WHERE project_id=?", (project_id,)
+        ).fetchall()
+        backup = backup_project(project, old_rows)
+        apply_merge(project, parsed, filename, stored_name)
+
+        old_path = Path(app.config["UPLOAD_DIR"]) / (project["stored_path"] or "")
+        if old_path.is_file() and old_path.name != stored_name:
+            old_path.unlink(missing_ok=True)
+
+        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        return jsonify(ok=True, preview=preview, project=project_json(row), backup=backup)
+
+    @bp.get("/admin/api/projects/<project_id>/source")
+    @auth.admin_required(lambda: get_db())
+    def admin_source(project_id):
+        db = get_db()
+        project = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if project is None:
+            raise WorkbookError("项目不存在")
+        path = Path(app.config["UPLOAD_DIR"]) / (project["stored_path"] or "")
+        if not path.is_file():
+            raise WorkbookError("源文件已丢失")
+        return send_file(path, as_attachment=True, download_name=project["filename"])
+
+    @bp.get("/admin/api/users")
+    @auth.admin_required(lambda: get_db())
+    def admin_users():
+        rows = get_db().execute(
+            "SELECT id, username, role, is_owner, created_at FROM users ORDER BY id"
+        ).fetchall()
+        return jsonify(users=[{key: row[key] for key in row.keys()} for row in rows])
+
+    @bp.post("/admin/api/users")
+    @auth.admin_required(lambda: get_db())
+    def admin_create_user():
+        data = request.get_json(silent=True) or {}
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        role = data.get("role") or "user"
+        is_owner = bool(data.get("is_owner"))
+        if not username or len(username) > 30:
+            return jsonify(error="用户名必填且不超过 30 字"), 400
+        if role not in ("admin", "user"):
+            return jsonify(error="角色只能是 admin 或 user"), 400
+        error = auth.password_error(password)
+        if error:
+            return jsonify(error=error), 400
+        db = get_db()
+        me = auth.current_user(db)
+        if is_owner and not me["is_owner"]:
+            return jsonify(error="只有超级管理员可以设置超级管理员"), 403
+        if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            return jsonify(error="用户名已存在"), 400
+        with db:
+            db.execute(
+                "INSERT INTO users(username, password_hash, role, is_owner, created_at)"
+                " VALUES(?,?,?,?,?)",
+                (username, auth.hash_password(password), role, int(is_owner),
+                 datetime.now().strftime("%Y-%m-%d %H:%M")),
+            )
+        return jsonify(ok=True), 201
+
+    @bp.post("/admin/api/users/<path:username>/password")
+    @auth.admin_required(lambda: get_db())
+    def admin_reset_password(username):
+        data = request.get_json(silent=True) or {}
+        password = data.get("password") or ""
+        error = auth.password_error(password)
+        if error:
+            return jsonify(error=error), 400
+        db = get_db()
+        target = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if target is None:
+            raise WorkbookError("用户不存在")
+        me = auth.current_user(db)
+        if target["is_owner"] and not me["is_owner"]:
+            return jsonify(error="只有超级管理员可以修改超级管理员密码"), 403
+        with db:
+            db.execute("UPDATE users SET password_hash=?, pwd_ver=pwd_ver+1 WHERE id=?",
+                       (auth.hash_password(password), target["id"]))
+        return jsonify(ok=True)
+
+    # ── 错误处理 ──────────────────────────────────────────────
     @app.errorhandler(WorkbookError)
     def workbook_error(error):
         return jsonify({"error": str(error)}), 400
@@ -364,7 +772,15 @@ def create_app(test_config=None):
     def too_large(_error):
         return jsonify({"error": "上传文件不能超过 36MB"}), 413
 
-    return app
+    @app.after_request
+    def no_cache_html(response):
+        # 发版后必须拿新页面；静态资源（带版本查询串）不受影响
+        if response.mimetype == "text/html":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    app.register_blueprint(bp)
+    return _EmptyPathFix(app)
 
 
 app = create_app()

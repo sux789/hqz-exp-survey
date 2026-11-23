@@ -1,0 +1,9 @@
+code: exp-survey
+name: 中幼林调查
+prefix: /exp-survey
+root: /home/www/bibook_deploy/apps/exp-survey
+factory: app:create_app
+static_url_path: /exp-survey/static
+auth: global
+description: 中幼林抚育样地调查（Excel 驱动 + 照片/轨迹）
+enabled: true

@@ -27,3 +27,16 @@ doc/health/last_gates.json
 .vscode/
 .workbuddy/
 node_modules/
+
+# Capacitor / Android 构建
+android/.gradle/
+android/app/build/
+android/build/
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/local.properties
+android/keystore.properties
+android/*.jks
+*.apk
+*.aab

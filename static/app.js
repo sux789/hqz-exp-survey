@@ -1,9 +1,26 @@
 const $ = (selector) => document.querySelector(selector);
+const BASE = (document.querySelector('meta[name="exp-base"]')?.content || '').replace(/\/+$/, '');
+const url = (path) => `${BASE}${path.startsWith('/') ? path : `/${path}`}`;
 const state = {
+  me: null,
   projects: [], project: null, detail: null, filters: { section: '', township: '', village: '', number: '' },
   saveTimer: null, saveRevision: 0, saveInFlight: false, toastTimer: null,
   map: null, polyline: null, markers: [], trackPoints: [], watchId: null, recording: false,
+  lastTrackAt: 0,
 };
+
+// 列表列：header 是 Excel 表头原文（用于匹配「不显示列」），label 是界面显示
+const COLUMNS = [
+  { header: '小班号', label: '小班号', field: 'number' },
+  { header: '村委会', label: '村委会', field: 'village' },
+  { header: '小班面积', label: '面积（亩）', field: 'area' },
+  { header: '树种组成', label: '树种组成', field: 'composition' },
+  { header: '郁闭度', label: '郁闭度', field: 'canopy' },
+  { header: '平均胸径', label: '平均胸径', field: 'avg_dbh' },
+  { header: '平均树高', label: '平均树高', field: 'avg_height' },
+  { header: '采伐方式', label: '采伐方式', field: 'cut_method' },
+  { header: '调查状态', label: '调查状态', field: 'status' },
+];
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -20,12 +37,44 @@ function toast(message, error = false) {
   state.toastTimer = setTimeout(() => node.classList.add('hidden'), 3600);
 }
 
-async function api(url, options = {}) {
-  const response = await fetch(url, options);
+async function api(path, options = {}) {
+  const response = await fetch(url(path), options);
   const type = response.headers.get('content-type') || '';
   const payload = type.includes('application/json') ? await response.json() : null;
+  if (response.status === 401) {
+    showLogin();
+    throw new Error(payload?.error || '登录已过期，请重新登录');
+  }
   if (!response.ok) throw new Error(payload?.error || `请求失败（${response.status}）`);
   return payload;
+}
+
+function showLogin() {
+  $('#loginMask').classList.remove('hidden');
+  $('#currentUser').classList.add('hidden');
+  $('#adminLink').classList.add('hidden');
+  $('#logoutButton').classList.add('hidden');
+  setTimeout(() => $('#loginUser').focus(), 50);
+}
+
+function hideLogin() {
+  $('#loginMask').classList.add('hidden');
+}
+
+function updateTopbar() {
+  const me = state.me;
+  if (!me?.user) return showLogin();
+  $('#currentUser').textContent = me.user;
+  $('#currentUser').classList.remove('hidden');
+  $('#logoutButton').classList.remove('hidden');
+  const visible = me.role === 'admin';
+  $('#adminLink').classList.toggle('hidden', !visible);
+  $('#adminTip').classList.toggle('hidden', !visible);
+}
+
+function canSee(column) {
+  const hidden = state.project?.params?.['不显示列'] || [];
+  return !hidden.includes(column.header);
 }
 
 function showView(name) {
@@ -77,33 +126,6 @@ function renderProjects() {
   list.querySelectorAll('[data-project-id]').forEach((button) => {
     button.addEventListener('click', () => navigate(`#/project/${button.dataset.projectId}`));
   });
-}
-
-async function uploadProject(file) {
-  if (!file) return;
-  if (!/\.xls[xm]$/i.test(file.name)) {
-    toast('请选择 .xlsx 或 .xlsm 文件', true);
-    return;
-  }
-  const progress = $('#uploadProgress');
-  progress.textContent = `正在上传并解析 ${file.name}…`;
-  progress.classList.remove('hidden');
-  $('#uploadZone').classList.add('disabled');
-  const form = new FormData();
-  form.append('file', file);
-  try {
-    const data = await api('/api/projects', { method: 'POST', body: form });
-    progress.textContent = `已导入 ${data.project.subcompartment_count} 个小班`;
-    toast('调查项目导入成功');
-    await loadProjects();
-    navigate(`#/project/${data.project.id}`);
-  } catch (error) {
-    progress.textContent = error.message;
-    toast(error.message, true);
-  } finally {
-    $('#uploadZone').classList.remove('disabled');
-    $('#projectFile').value = '';
-  }
 }
 
 async function loadProject(projectId) {
@@ -163,18 +185,22 @@ function matchingRows() {
 
 function renderSubcompartments() {
   const rows = matchingRows();
+  const columns = COLUMNS.filter(canSee);
   $('#filterCount').textContent = `匹配 ${rows.length} / ${state.project.subcompartments.length} 个小班`;
   $('#emptySubcompartments').classList.toggle('hidden', rows.length > 0);
+  $('#subcompartmentHead').innerHTML = `<tr>${columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join('')}</tr>`;
   $('#subcompartmentRows').innerHTML = rows.map((row) => {
     const fields = row.fields;
-    return `<tr>
-      <td><button class="sub-link" type="button" data-sub-id="${row.id}">${escapeHtml(fields.number)}</button></td>
-      <td>${escapeHtml(fields.village || '—')}</td><td>${escapeHtml(fields.area ?? '—')}</td>
-      <td>${escapeHtml(fields.composition || '—')}</td><td>${escapeHtml(fields.canopy ?? '—')}</td>
-      <td>${escapeHtml(fields.avg_dbh ?? '—')}</td><td>${escapeHtml(fields.avg_height ?? '—')}</td>
-      <td>${escapeHtml(fields.cut_method || '—')}</td>
-      <td><span class="status-pill ${row.has_survey ? 'done' : ''}">${row.has_survey ? '已调查' : '待调查'}</span></td>
-    </tr>`;
+    const cells = columns.map((column) => {
+      if (column.field === 'number') {
+        return `<td><button class="sub-link" type="button" data-sub-id="${row.id}">${escapeHtml(fields.number)}</button></td>`;
+      }
+      if (column.field === 'status') {
+        return `<td><span class="status-pill ${row.has_survey ? 'done' : ''}">${row.has_survey ? '已调查' : '待调查'}</span></td>`;
+      }
+      return `<td>${escapeHtml(fields[column.field] ?? '—')}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
   }).join('');
   $('#subcompartmentRows').querySelectorAll('[data-sub-id]').forEach((button) => {
     button.addEventListener('click', () => navigate(`#/sub/${button.dataset.subId}`));
@@ -203,7 +229,7 @@ async function loadDetail(subId) {
       state.detail.survey = emptySurvey(state.detail);
     }
     renderDetail();
-    initTrackMap();
+    if (state.detail.params?.has_track !== false) initTrackMap();
   } catch (error) {
     toast(error.message, true);
     if (state.project) navigate(`#/project/${state.project.id}`);
@@ -224,7 +250,24 @@ function renderDetail() {
   state.trackPoints = detail.track || [];
   const cached = readTrackCache();
   if (cached.length > state.trackPoints.length) state.trackPoints = cached;
+  applyParamsToDetail();
   updateTrackUI(true);
+}
+
+/** 「程序参数」sheet 决定详情页显示哪些工具、照片怎么压。 */
+function applyParamsToDetail() {
+  const params = state.detail?.params || {};
+  const hasPhoto = params.has_photo !== false;
+  const hasTrack = params.has_track !== false;
+  $('#photoCard').classList.toggle('hidden', !hasPhoto);
+  $('#trackCard').classList.toggle('hidden', !hasTrack);
+  $('#toolsGrid').classList.toggle('single', !hasPhoto || !hasTrack);
+  $('#photoHint').textContent = hasPhoto
+    ? `自动等比压缩至最长边 ${params.压缩最长边 || 1440}px、质量 ${params.压缩质量 ?? 0.8}，并添加水印。`
+    : '';
+  $('#trackStatus').textContent = hasTrack
+    ? `卫星底图需要网络；每 ${params.轨迹采样间隔 || 5} 秒取一个定位点。`
+    : '';
 }
 
 function countControl(type, species, dbh, value) {
@@ -409,31 +452,40 @@ async function imageSource(file) {
 }
 
 async function compressPhoto(file, coordinates) {
+  const params = state.detail?.params || {};
+  const maxEdge = Number(params.压缩最长边) || 1440;
+  const quality = Math.min(1, Math.max(0.3, Number(params.压缩质量) || 0.8));
+  const marks = params.水印内容 || ['时间', '坐标', '小班'];
   const source = await imageSource(file);
   const width = source.width || source.naturalWidth;
   const height = source.height || source.naturalHeight;
-  const scale = Math.min(1, 1440 / Math.max(width, height));
+  const scale = Math.min(1, maxEdge / Math.max(width, height));
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(width * scale));
   canvas.height = Math.max(1, Math.round(height * scale));
   const context = canvas.getContext('2d');
   context.drawImage(source, 0, 0, canvas.width, canvas.height);
-  const fontSize = Math.max(15, Math.round(canvas.width / 48));
-  const lineHeight = Math.round(fontSize * 1.45);
-  const boxHeight = lineHeight * 3 + 18;
-  const gradient = context.createLinearGradient(0, canvas.height - boxHeight, 0, canvas.height);
-  gradient.addColorStop(0, 'rgba(0,0,0,0)');
-  gradient.addColorStop(.3, 'rgba(0,0,0,.65)');
-  gradient.addColorStop(1, 'rgba(0,0,0,.82)');
-  context.fillStyle = gradient;
-  context.fillRect(0, canvas.height - boxHeight, canvas.width, boxHeight);
-  context.fillStyle = '#fff';
-  context.font = `${fontSize}px -apple-system, PingFang SC, sans-serif`;
-  context.textBaseline = 'bottom';
-  const lines = [new Date().toLocaleString('zh-CN', { hour12: false }), coordinates ? `WGS-84  ${coordinates}` : '定位未获取', `小班 ${state.detail.fields.number}`];
-  lines.forEach((line, index) => context.fillText(line, 14, canvas.height - 10 - (lines.length - 1 - index) * lineHeight));
+  const lines = [];
+  if (marks.includes('时间')) lines.push(new Date().toLocaleString('zh-CN', { hour12: false }));
+  if (marks.includes('坐标')) lines.push(coordinates ? `WGS-84  ${coordinates}` : '定位未获取');
+  if (marks.includes('小班')) lines.push(`小班 ${state.detail.fields.number}`);
+  if (lines.length) {
+    const fontSize = Math.max(15, Math.round(canvas.width / 48));
+    const lineHeight = Math.round(fontSize * 1.45);
+    const boxHeight = lineHeight * lines.length + 18;
+    const gradient = context.createLinearGradient(0, canvas.height - boxHeight, 0, canvas.height);
+    gradient.addColorStop(0, 'rgba(0,0,0,0)');
+    gradient.addColorStop(.3, 'rgba(0,0,0,.65)');
+    gradient.addColorStop(1, 'rgba(0,0,0,.82)');
+    context.fillStyle = gradient;
+    context.fillRect(0, canvas.height - boxHeight, canvas.width, boxHeight);
+    context.fillStyle = '#fff';
+    context.font = `${fontSize}px -apple-system, PingFang SC, sans-serif`;
+    context.textBaseline = 'bottom';
+    lines.forEach((line, index) => context.fillText(line, 14, canvas.height - 10 - (lines.length - 1 - index) * lineHeight));
+  }
   if (source.close) source.close();
-  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('图片编码失败')), 'image/jpeg', .8));
+  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('图片编码失败')), 'image/jpeg', quality));
 }
 
 async function handlePhoto(file) {
@@ -512,7 +564,7 @@ function updateTrackUI(fit = false) {
   const exportLink = $('#exportTrack');
   exportLink.classList.toggle('disabled', !points.length);
   exportLink.setAttribute('aria-disabled', points.length ? 'false' : 'true');
-  exportLink.href = points.length ? `/api/subcompartments/${state.detail.id}/track.gpx` : '#';
+  exportLink.href = points.length ? url(`/api/subcompartments/${state.detail.id}/track.gpx`) : '#';
   if (state.polyline) {
     const latLngs = points.map((point) => [point.lat, point.lng]);
     state.polyline.setLatLngs(latLngs);
@@ -531,6 +583,11 @@ function updateTrackUI(fit = false) {
 }
 
 function addTrackPoint(position) {
+  // 采样间隔由「程序参数」控制：watchPosition 本身按系统频率回调，这里按时间窗节流
+  const gap = (Number(state.detail?.params?.轨迹采样间隔) || 5) * 1000;
+  const now = Date.now();
+  if (state.lastTrackAt && now - state.lastTrackAt < gap) return;
+  state.lastTrackAt = now;
   const point = {
     lat: position.coords.latitude, lng: position.coords.longitude, timestamp: position.timestamp || Date.now(),
     accuracy: position.coords.accuracy ?? null,
@@ -562,6 +619,7 @@ function startTracking() {
 function stopTracking(save = true) {
   if (state.watchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(state.watchId);
   state.watchId = null;
+  state.lastTrackAt = 0;
   const wasRecording = state.recording;
   state.recording = false;
   if (state.detail) {
@@ -599,16 +657,6 @@ async function handleRoute() {
   else await loadProjects();
 }
 
-$('#projectFile').addEventListener('change', (event) => uploadProject(event.target.files[0]));
-['dragenter', 'dragover'].forEach((name) => $('#uploadZone').addEventListener(name, (event) => {
-  event.preventDefault();
-  $('#uploadZone').classList.add('dragging');
-}));
-['dragleave', 'drop'].forEach((name) => $('#uploadZone').addEventListener(name, (event) => {
-  event.preventDefault();
-  $('#uploadZone').classList.remove('dragging');
-}));
-$('#uploadZone').addEventListener('drop', (event) => uploadProject(event.dataTransfer.files[0]));
 $('#backButton').addEventListener('click', () => {
   if (state.detail && !$('#detailView').classList.contains('hidden')) {
     if (state.saveRevision) saveSurvey();
@@ -668,4 +716,55 @@ document.addEventListener('visibilitychange', () => {
     if (state.trackPoints.length) saveTrack(false);
   }
 });
-handleRoute();
+
+$('#loginForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const errorNode = $('#loginError');
+  errorNode.textContent = '';
+  try {
+    const response = await fetch(url('/api/login'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('#loginUser').value.trim(), password: $('#loginPwd').value }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      errorNode.textContent = payload.error || '登录失败';
+      return;
+    }
+    state.me = payload;
+    $('#loginPwd').value = '';
+    hideLogin();
+    updateTopbar();
+    await handleRoute();
+  } catch (error) {
+    errorNode.textContent = error.message;
+  }
+});
+
+$('#logoutButton').addEventListener('click', async () => {
+  try { await fetch(url('/api/logout'), { method: 'POST' }); } catch (_) {}
+  state.me = null;
+  state.detail = null;
+  state.project = null;
+  showLogin();
+});
+
+async function bootstrap() {
+  try {
+    const me = await fetch(url('/api/me')).then((response) => response.json());
+    if (!me.user) {
+      showLogin();
+      return;
+    }
+    state.me = me;
+    hideLogin();
+    updateTopbar();
+    await handleRoute();
+  } catch (error) {
+    toast(error.message, true);
+    showLogin();
+  }
+}
+
+bootstrap();

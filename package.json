@@ -1,0 +1,18 @@
+{
+  "name": "hqz-exp-survey-android",
+  "version": "0.1.0",
+  "private": true,
+  "description": "中幼林抚育调查 Android 壳（Capacitor WebView 指向 forest.bibook.top/exp-survey，网页更新无需重装）",
+  "scripts": {
+    "build": "echo \"no web build step; web served from remote server\"",
+    "sync": "cap sync android",
+    "open": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/core": "^6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0"
+  }
+}

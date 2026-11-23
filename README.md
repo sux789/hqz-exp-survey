@@ -1,37 +1,53 @@
 # 中幼林抚育调查
 
-基于 `project-template` 创建的移动优先调查应用。上传调查设计总表后，可筛选小班、按树种组成录入样地数据、实时计算材积、压缩样地照片并记录卫星轨迹。
+Excel 驱动的中幼林样地调查 App：管理员在 `/admin/` 上传调查设计总表，调查员在手机端筛选小班、按树种组成录入样地数据、实时计算材积、压缩照片并记录 WGS-84 轨迹。
 
-## 功能
+- **线上**：`https://forest.bibook.top/exp-survey/`（gateway 挂载，appspec 在 `deploy/`）
+- **本地**：`/usr/bin/python3 main.py` → <http://127.0.0.1:5000>
+- **App**：`top.bibook.expsurvey`「中幼林调查」，Capacitor 远程 URL 壳，网页更新无需重装
 
-- 项目列表保留 Excel 原始文件名，第一个 sheet 作为调查基础数据。
-- 标段 → 乡镇 → 村委会级联筛选，小班号模糊搜索。
-- 调查页依据小班树种组成和“样地表”生成固定胸径网格；株数数字控件、树高数值输入、公式即时计算、自动保存。
-- 照片等比压缩至最长边 1440px、JPEG 质量 0.8，添加时间/坐标/小班水印。
-- Leaflet 卫星底图、WGS-84 轨迹、距离统计、本机缓存和 GPX 导出。
+## 账号与权限
 
-## 运行
+- 首次启动自动建超管：环境变量 `EXP_ADMIN_USER` / `EXP_ADMIN_PASSWORD`，缺省 `admin` / `admin123`（**生产必须覆盖并立即改密**）。
+- `admin` 才能进 `/admin/` 上传与覆盖；`user` 只能调查。
+- 覆盖已有项目：**上传人本人或超级管理员**，且要照原样输入当前项目文件名。
+- 覆盖按小班号对齐，就地更新基础数据；已填调查、照片、轨迹全部保留；写库前自动备份到 `instance/backups/`。
+
+## Excel 约定
+
+- **第一个 sheet** = 调查基础数据，必须有「小班号」「树种组成」。
+- **样地表** = 固定胸径、树种 a/b/c 材积公式、采伐公式、每公顷系数。
+- **程序参数**（可选，兼容旧名「参数」）= 六列 `key|value|类型|默认值|说明|示例`：
+
+| key | 取值 | 默认 |
+|---|---|---|
+| 功能 | `拍照;视频;轨迹;打卡` | `拍照;轨迹`（不含轨迹即不显示轨迹） |
+| 压缩最长边 | 320–4096 | 1440 |
+| 压缩质量 | 0.3–1.0 | 0.8 |
+| 不显示列 | 基础数据表头名，`;` 分隔 | 空 |
+| 水印内容 | `时间;坐标;小班` | 全部 |
+| 轨迹采样间隔 | 1–60 秒 | 5 |
+
+坏配置一律带 Excel 行号报错（未知 key、全角分隔符、越界、隐藏列不存在）。没有参数表时行为与 v1.0 完全一致。
+
+## 运行与验证
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 main.py
+/usr/bin/python3 -m pip install -r requirements.txt
+/usr/bin/python3 main.py
+/usr/bin/python3 -m unittest discover -s tests -v          # 16 项
+PYTHON=/usr/bin/python3 bash tools/run.sh --out out/ --data data/中幼林抚育林木采伐调查设计总表.xlsx --json
 ```
 
-打开 `http://127.0.0.1:5000`。运行数据保存在 `instance/`，该目录不入库。卫星瓦片和浏览器定位需要网络及定位授权；轨迹记录期间应保持页面开启。
-
-## 验证
+## 部署
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 main.py --data data/ --out out/
-bash tools/run.sh --out out/ --data data/中幼林抚育林木采伐调查设计总表.xlsx --json
+INSTALL=1 bash deploy.sh     # 首次：装依赖 + 同步 + appspec + 登记 + 重启 gateway
+bash deploy.sh               # 日常
 ```
 
-浏览器冒烟测试 `tools/ui_smoke.mjs` 使用本机 Chrome 的 CDP，覆盖上传、筛选、公式、刷新持久化、图片尺寸、轨迹和移动布局。运行前需启动应用及 `--remote-debugging-port=9222` 的隔离 Chrome。
+App 出包：推 `v*` tag → GitHub Actions 构建签名 APK 并发布 Releases（需 4 个 Secret：`KEYSTORE_BASE64` / `KEY_ALIAS` / `KEYSTORE_PASSWORD` / `KEY_PASSWORD`）；推送 `android/**` 只出 debug 包。
 
 ## 数据口径
 
-- `workbook.py` 根据第一个 sheet 的表头文本定位数据，并提取“样地表”的固定胸径、树种二元材积参数、采伐公式和每公顷系数；未配置树种公式会明确报错。
-- 单株材积为 `ROUND(a × D^b × H^c, 3)`，径阶蓄积为单株材积乘株数；采伐蓄积直接使用样地表采伐公式。
-- 平均胸径采用株数加权平方平均，每公顷株数/蓄积沿用样地表系数。
-- 公式与模板结构的迭代依据见 `doc/004-v1.0_中幼林抚育调查应用.md`。
+单株材积 `ROUND(a × D^b × H^c, 3)`；径阶蓄积 = 单株材积 × 株数；平均胸径为株数加权平方平均；每公顷换算沿用样地表系数。公式依据见 `doc/004`，v1.1 变更见 `doc/005`。
