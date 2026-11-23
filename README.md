@@ -21,21 +21,27 @@ Excel 驱动的中幼林样地调查 App：管理员在 `/admin/` 上传调查�
 
 | key | 取值 | 默认 |
 |---|---|---|
-| 功能 | `拍照;视频;轨迹;打卡` | `拍照;轨迹`（不含轨迹即不显示轨迹） |
+| 功能 | `拍照;视频;轨迹;打卡` | `拍照`（**默认不显示轨迹**，需要就加「轨迹」） |
 | 压缩最长边 | 320–4096 | 1440 |
 | 压缩质量 | 0.3–1.0 | 0.8 |
 | 不显示列 | 基础数据表头名，`;` 分隔 | 空 |
 | 水印内容 | `时间;坐标;小班` | 全部 |
 | 轨迹采样间隔 | 1–60 秒 | 5 |
 
-坏配置一律带 Excel 行号报错（未知 key、全角分隔符、越界、隐藏列不存在）。没有参数表时行为与 v1.0 完全一致。
+坏配置一律带 Excel 行号报错（未知 key、全角分隔符、越界、隐藏列不存在）。现成样板：`data/程序参数模板.xlsx`（复制这张 sheet 进总表即可）。
+
+## 照片与导出
+
+- **拍照**：Canvas 等比压缩（参数「压缩最长边/质量」）→ 左下角白底黑字水印（时间/坐标/小班）→ 上传服务器。水印的时间与经纬度**优先取原片 EXIF**，压缩后把 EXIF 回写进上传的那份（piexifjs），失败静默退回原行为。
+- **导出**：App 项目页点「导出全部样地 Excel」，得到一个 xlsx，**每个小班一张 sheet**（基本信息 + 树种×径阶株数/树高/单株材积/蓄积 + 采伐 + 汇总 + 照片数与轨迹点数）；未调查的小班也会有一张 sheet 并写明「尚未录入」。
 
 ## 运行与验证
 
 ```bash
 /usr/bin/python3 -m pip install -r requirements.txt
 /usr/bin/python3 main.py
-/usr/bin/python3 -m unittest discover -s tests -v          # 22 项
+/usr/bin/python3 -m unittest discover -s tests -v          # 29 项（含 node 跑的 EXIF 20 条）
+node tests/test_exif.js                                     # 前端 EXIF 纯逻辑
 PYTHON=/usr/bin/python3 bash tools/run.sh --out out/ --data data/中幼林抚育林木采伐调查设计总表.xlsx --json
 ```
 

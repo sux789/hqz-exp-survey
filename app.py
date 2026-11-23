@@ -37,12 +37,14 @@ auth = _local_module("auth")
 _calc = _local_module("calculations")
 _pp = _local_module("param_parser")
 _workbook = _local_module("workbook")
+_export = _local_module("export_xlsx")
 calculate_summary = _calc.calculate_summary
 haversine_distance = _calc.haversine_distance
 default_params = _pp.default_params
 public_params = _pp.public_params
 WorkbookError = _workbook.WorkbookError
 parse_workbook = _workbook.parse_workbook
+build_project_workbook = _export.build_project_workbook
 
 # gateway 约定：create_app(prefix='/exp-survey')，DispatcherMiddleware 已剥前缀并设 SCRIPT_NAME，
 # 所以路由**不挂** url_prefix（否则双重前缀 404）；prefix 只用于页面 base 与 cookie 限定。
@@ -88,7 +90,7 @@ MIGRATIONS = (
 # 静态资源版本：每次发版递增，模板把它拼到 ?v= 上。
 # 原因：Capacitor WebView 会把 app.js 缓存到本地，HTML 改了但 JS 还是旧的 →
 # 旧页面继续 POST 已删除的 /api/login，拿到 404 HTML 就报 "is not valid JSON"。
-ASSET_VERSION = "v1.2.1"
+ASSET_VERSION = "v1.3.0"
 
 
 def parse_blob(filename, blob):
@@ -347,6 +349,40 @@ def create_app(prefix="", test_config=None):
         result = project_json(project)
         result["subcompartments"] = [sub_summary(row) for row in rows]
         return jsonify(result)
+
+    @bp.get("/api/projects/<project_id>/export.xlsx")
+    @auth.login_required
+    def project_export(project_id):
+        """全部小班 → 一个 xlsx，每个小班一张 sheet（C18）。"""
+        db = get_db()
+        project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if project is None:
+            raise WorkbookError("项目不存在")
+        rows = db.execute(
+            "SELECT * FROM subcompartments WHERE project_id = ? ORDER BY source_row", (project_id,)
+        ).fetchall()
+        counts = dict(db.execute(
+            "SELECT s.id, COUNT(p.id) FROM subcompartments s"
+            " JOIN photos p ON p.subcompartment_id = s.id"
+            " WHERE s.project_id = ? GROUP BY s.id", (project_id,)
+        ).fetchall())
+        subs = [{
+            "source_row": row["source_row"],
+            "fields": json.loads(row["fields_json"]),
+            "species": json.loads(row["species_json"]),
+            "survey": json.loads(row["survey_json"]),
+            "track": json.loads(row["track_json"]),
+            "photo_count": counts.get(row["id"], 0),
+        } for row in rows]
+        buffer, sheet_count = build_project_workbook(
+            project["filename"], json.loads(project["schema_json"]), subs)
+        stem = Path(project["filename"]).stem or "样地"
+        name = f"{stem}_样地明细_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        app.logger.info("导出项目 %s：%s 张 sheet", project_id, sheet_count)
+        return send_file(
+            buffer, as_attachment=True, download_name=name,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     @bp.get("/api/subcompartments/<int:sub_id>")
     @auth.login_required

@@ -142,6 +142,7 @@ async function loadProject(projectId) {
     state.filters = { section: '', township: '', village: '', number: '' };
     $('#projectTitle').textContent = state.project.filename;
     $('#projectMeta').textContent = `共 ${state.project.subcompartments.length} 个小班`;
+    $('#exportAll').href = url(`/api/projects/${projectId}/export.xlsx`);
     $('#filterNumber').value = '';
     populateFilters();
     renderSubcompartments();
@@ -268,7 +269,7 @@ function applyParamsToDetail() {
   $('#trackCard').classList.toggle('hidden', !hasTrack);
   $('#toolsGrid').classList.toggle('single', !hasPhoto || !hasTrack);
   $('#photoHint').textContent = hasPhoto
-    ? `自动等比压缩至最长边 ${params.压缩最长边 || 1440}px、质量 ${params.压缩质量 ?? 0.8}，并添加水印。`
+    ? `自动等比压缩至最长边 ${params.压缩最长边 || 1440}px、质量 ${params.压缩质量 ?? 0.8}；水印时间与坐标优先取原片 EXIF。`
     : '';
   $('#trackStatus').textContent = hasTrack
     ? `卫星底图需要网络；每 ${params.轨迹采样间隔 || 5} 秒取一个定位点。`
@@ -441,6 +442,38 @@ function currentCoordinates() {
   });
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/* ── EXIF（对齐 hqz-supervision doc/017）─────────────────────────
+   Canvas 重绘必然丢 EXIF，这是管线行为不是 bug。这里做两件事：
+   ① 水印的时间/经纬度优先取原片 EXIF（相机定位比浏览器 geolocation 权威，且不依赖权限）
+   ② 压缩后把原片 EXIF 回写进上传的那份，服务器拿到的是机器可读的时间与坐标
+   纯逻辑在 static/photo_exif.js（依赖 vendor/piexif.js），任何失败都静默退回原行为。 */
+async function photoExif(file) {
+  try {
+    if (!(window.piexif && window.PhotoExif && file)) return null;
+    if (!/jpe?g/i.test(file.type || file.name || '')) return null;
+    return PhotoExif.exifOfDataUrl(await blobToDataUrl(file), window.piexif);
+  } catch (_) { return null; }
+}
+
+async function keepExif(original, blob) {
+  try {
+    if (!(window.piexif && window.PhotoExif && original)) return blob;
+    if (!/jpe?g/i.test(original.type || original.name || '')) return blob;
+    const url = PhotoExif.preserveExifDataUrl(
+      await blobToDataUrl(original), await blobToDataUrl(blob), window.piexif);
+    return await (await fetch(url)).blob();
+  } catch (_) { return blob; }
+}
+
 async function imageSource(file) {
   if ('createImageBitmap' in window) {
     try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (_) {}
@@ -456,7 +489,9 @@ async function imageSource(file) {
   }
 }
 
-async function compressPhoto(file, coordinates) {
+/* 水印版式对齐 supervision：半透明白底块 + 实心黑字（省比特，同质量下体积更小、字更清楚）。
+   时间优先用原片 EXIF 的拍摄时刻，坐标同理；都没有才退回浏览器定位与当前时间。 */
+async function compressPhoto(file, coordinates, takenAt) {
   const params = state.detail?.params || {};
   const maxEdge = Number(params.压缩最长边) || 1440;
   const quality = Math.min(1, Math.max(0.3, Number(params.压缩质量) || 0.8));
@@ -470,27 +505,64 @@ async function compressPhoto(file, coordinates) {
   canvas.height = Math.max(1, Math.round(height * scale));
   const context = canvas.getContext('2d');
   context.drawImage(source, 0, 0, canvas.width, canvas.height);
-  const lines = [];
-  if (marks.includes('时间')) lines.push(new Date().toLocaleString('zh-CN', { hour12: false }));
-  if (marks.includes('坐标')) lines.push(coordinates ? `WGS-84  ${coordinates}` : '定位未获取');
-  if (marks.includes('小班')) lines.push(`小班 ${state.detail.fields.number}`);
-  if (lines.length) {
-    const fontSize = Math.max(15, Math.round(canvas.width / 48));
-    const lineHeight = Math.round(fontSize * 1.45);
-    const boxHeight = lineHeight * lines.length + 18;
-    const gradient = context.createLinearGradient(0, canvas.height - boxHeight, 0, canvas.height);
-    gradient.addColorStop(0, 'rgba(0,0,0,0)');
-    gradient.addColorStop(.3, 'rgba(0,0,0,.65)');
-    gradient.addColorStop(1, 'rgba(0,0,0,.82)');
-    context.fillStyle = gradient;
-    context.fillRect(0, canvas.height - boxHeight, canvas.width, boxHeight);
-    context.fillStyle = '#fff';
-    context.font = `${fontSize}px -apple-system, PingFang SC, sans-serif`;
-    context.textBaseline = 'bottom';
-    lines.forEach((line, index) => context.fillText(line, 14, canvas.height - 10 - (lines.length - 1 - index) * lineHeight));
-  }
   if (source.close) source.close();
-  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('图片编码失败')), 'image/jpeg', quality));
+
+  const moment = (takenAt instanceof Date && !isNaN(takenAt)) ? takenAt : new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())}`
+    + ` ${pad(moment.getHours())}:${pad(moment.getMinutes())}:${pad(moment.getSeconds())}`;
+  const lines = [];
+  if (marks.includes('时间')) lines.push(`时间：${stamp}`);
+  if (marks.includes('坐标')) lines.push(`坐标：${coordinates || '定位未获取'}`);
+  if (marks.includes('小班')) lines.push(`小班：${state.detail.fields.number}`);
+  if (lines.length) {
+    let fontSize = Math.max(18, Math.round(canvas.width / 34));
+    let lineHeight = Math.round(fontSize * 1.45);
+    let padX = Math.round(fontSize * 0.7);
+    let padY = Math.round(fontSize * 0.5);
+    let margin = Math.round(fontSize * 0.55);
+    const maxHeight = canvas.height * 0.55;
+    let boxHeight = lines.length * lineHeight + padY * 2;
+    if (boxHeight > maxHeight) {
+      const ratio = maxHeight / boxHeight;
+      fontSize = Math.max(14, Math.round(fontSize * ratio));
+      lineHeight = Math.round(fontSize * 1.45);
+      padX = Math.round(fontSize * 0.7);
+      padY = Math.round(fontSize * 0.5);
+      margin = Math.round(fontSize * 0.55);
+      boxHeight = lines.length * lineHeight + padY * 2;
+    }
+    context.font = `${fontSize}px system-ui,'PingFang SC','Microsoft YaHei',sans-serif`;
+    context.textAlign = 'left';
+    context.textBaseline = 'bottom';
+    let textWidth = 0;
+    for (const line of lines) textWidth = Math.max(textWidth, context.measureText(line).width);
+    const boxWidth = Math.max(Math.round(canvas.width * 0.3),
+      Math.min(canvas.width - margin * 2, Math.ceil(textWidth) + padX * 2));
+    const boxX = margin;
+    const boxY = Math.max(margin, canvas.height - boxHeight - margin);
+    const radius = Math.round(fontSize * 0.35);
+    context.fillStyle = 'rgba(255,255,255,.62)';
+    context.beginPath();
+    context.moveTo(boxX + radius, boxY);
+    context.lineTo(boxX + boxWidth - radius, boxY);
+    context.quadraticCurveTo(boxX + boxWidth, boxY, boxX + boxWidth, boxY + radius);
+    context.lineTo(boxX + boxWidth, boxY + boxHeight - radius);
+    context.quadraticCurveTo(boxX + boxWidth, boxY + boxHeight, boxX + boxWidth - radius, boxY + boxHeight);
+    context.lineTo(boxX + radius, boxY + boxHeight);
+    context.quadraticCurveTo(boxX, boxY + boxHeight, boxX, boxY + boxHeight - radius);
+    context.lineTo(boxX, boxY + radius);
+    context.quadraticCurveTo(boxX, boxY, boxX + radius, boxY);
+    context.closePath();
+    context.fill();
+    context.fillStyle = '#111';
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const y = boxY + boxHeight - padY - (lines.length - 1 - index) * lineHeight;
+      context.fillText(lines[index], boxX + padX, y);
+    }
+  }
+  return new Promise((resolve, reject) => canvas.toBlob(
+    (blob) => (blob ? resolve(blob) : reject(new Error('图片编码失败'))), 'image/jpeg', quality));
 }
 
 async function handlePhoto(file) {
@@ -499,11 +571,14 @@ async function handlePhoto(file) {
     toast('请选择图片文件', true);
     return;
   }
-  $('#photoStatus').textContent = '正在压缩并添加水印…';
+  $('#photoStatus').textContent = '正在读取定位与水印…';
   $('#takePhoto').disabled = true;
   try {
-    const [source, coordinates] = await Promise.all([Promise.resolve(file), currentCoordinates()]);
-    const blob = await compressPhoto(source, coordinates);
+    const meta = await photoExif(file);
+    const coordinates = (meta && meta.lat != null)
+      ? `${meta.lat.toFixed(5)}, ${meta.lng.toFixed(5)}`
+      : await currentCoordinates();
+    const blob = await keepExif(file, await compressPhoto(file, coordinates, meta && meta.takenAt));
     $('#photoStatus').textContent = `已压缩 ${(file.size / 1024).toFixed(0)} KB → ${(blob.size / 1024).toFixed(0)} KB，正在上传…`;
     const form = new FormData();
     form.append('file', blob, `${state.detail.fields.number}_${Date.now()}.jpg`);
@@ -511,7 +586,8 @@ async function handlePhoto(file) {
     const data = await api(`/api/subcompartments/${state.detail.id}/photos`, { method: 'POST', body: form });
     state.detail.photos.unshift(data.photo);
     renderPhotos();
-    $('#photoStatus').textContent = `已保存，压缩 ${Math.max(0, Math.round((1 - blob.size / file.size) * 100))}%`;
+    $('#photoStatus').textContent = `已保存，压缩 ${Math.max(0, Math.round((1 - blob.size / file.size) * 100))}%`
+      + (meta ? '，EXIF 已保留' : '');
     toast('照片压缩并保存成功');
   } catch (error) {
     $('#photoStatus').textContent = error.message;

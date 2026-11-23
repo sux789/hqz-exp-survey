@@ -2,14 +2,16 @@ import io
 import json
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-from app import create_app
+from app import ASSET_VERSION, create_app
 from calculations import calculate_summary, unit_volume
+from export_xlsx import build_project_workbook
 from workbook import WorkbookError, parse_workbook
 
 
@@ -66,9 +68,9 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(set(parsed["schema"]["species"]), {"云南松", "油杉", "其他阔叶", "栎类"})
         self.assertEqual(parsed["schema"]["area_factor"], 15)
 
-    def test_workbook_without_param_sheet_keeps_v1_defaults(self):
+    def test_workbook_without_param_sheet_defaults_to_photo_only(self):
         params = parse_workbook(SAMPLE)["params"]
-        self.assertEqual(params["功能"], ["拍照", "轨迹"])
+        self.assertEqual(params["功能"], ["拍照"])          # v1.3：默认不显示轨迹（C17）
         self.assertEqual(params["压缩最长边"], 1440)
         self.assertEqual(params["压缩质量"], 0.8)
         self.assertEqual(params["source_sheet"], "")
@@ -249,6 +251,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(users.status_code, 410)
         self.assertTrue(users.is_json)
 
+    def test_export_requires_login_and_returns_one_sheet_per_plot(self):
+        url = f"/api/projects/{self.project['id']}/export.xlsx"
+        self.logout()
+        self.assertEqual(self.client.get(url).status_code, 401)
+        self.login(1)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("spreadsheetml", response.headers["Content-Type"])
+        self.assertIn(".xlsx", response.headers["Content-Disposition"])
+        wb = load_workbook(io.BytesIO(response.data))
+        self.assertEqual(len(wb.sheetnames), 684)      # 每个小班一张 sheet
+        self.assertEqual(wb.sheetnames[0], "XP-01")
+        response.close()
+
     def test_project_uses_original_filename(self):
         response = self.client.get("/api/projects")
         self.assertEqual(response.get_json()["projects"][0]["filename"], SAMPLE.name)
@@ -263,7 +279,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in detail["species"]], ["云南松", "其他阔叶"])
         self.assertEqual(detail["schema"]["diameters"][0], 6)
         self.assertTrue(detail["params"]["has_photo"])
-        self.assertTrue(detail["params"]["has_track"])
+        self.assertFalse(detail["params"]["has_track"])     # 默认不带轨迹
 
     def test_survey_autosave_calculates_and_rejects_invalid_counts(self):
         sub_id = self.first_sub()
@@ -286,7 +302,13 @@ class ApiTests(unittest.TestCase):
         self.assertIn("必须是整数", response.get_json()["error"])
 
     def test_track_save_and_gpx_export(self):
-        sub_id = self.first_sub()
+        # 轨迹是可选功能：显式在参数 sheet 里打开，才允许记录与导出
+        project = self.upload("含轨迹.xlsx", workbook_with_params([
+            ["功能", "拍照;轨迹", "列表", "拍照", "打开轨迹", ""],
+        ]))
+        detail = self.client.get(f"/api/projects/{project['id']}").get_json()
+        self.assertTrue(detail["params"]["has_track"])
+        sub_id = detail["subcompartments"][0]["id"]
         points = [
             {"lat": 24.1, "lng": 102.1, "timestamp": 1700000000000, "accuracy": 5},
             {"lat": 24.1001, "lng": 102.1001, "timestamp": 1700000001000, "accuracy": 4},
@@ -298,6 +320,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(gpx.status_code, 200)
         self.assertIn(b'<name>', gpx.data)
         self.assertIn(b'XP-01', gpx.data)
+
+    def test_track_is_rejected_when_param_disables_it(self):
+        response = self.client.put(f"/api/subcompartments/{self.first_sub()}/track",
+                                   json={"points": []})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("轨迹", response.get_json()["error"])
 
     def test_rejects_unknown_species(self):
         sub_id = self.first_sub()
@@ -412,9 +440,70 @@ class GatewayMountTests(unittest.TestCase):
         html = self.client.get("/", environ_overrides={"SCRIPT_NAME": "/exp-survey"}).get_data(as_text=True)
         self.assertIn("/exp-survey/static/app.js?v=", html)
         self.assertNotIn('app.js"', html)   # 不能再有无版本号的引用
-        js = self.client.get("/static/app.js?v=v1.2.1")
+        js = self.client.get(f"/static/app.js?v={ASSET_VERSION}")
         self.assertEqual(js.headers["Cache-Control"], "public, max-age=604800")
         js.close()   # 释放静态文件句柄，避免 ResourceWarning 噪音
+
+
+class ExportTests(unittest.TestCase):
+    """全量导出：一个项目一个 xlsx，每个小班一张 sheet（C18）。"""
+
+    def setUp(self):
+        parsed = parse_workbook(SAMPLE)
+        self.schema = parsed["schema"]
+        self.subs = [{
+            "source_row": 1,
+            "fields": {"number": "XP-01", "village": "弥勒村", "area": 220.72,
+                       "composition": "9云南松1其他阔叶", "canopy": 0.8,
+                       "avg_dbh": 17.2, "avg_height": 10, "cut_method": "生长伐"},
+            "species": [{"name": "云南松", "coefficient": 9.0},
+                        {"name": "其他阔叶", "coefficient": 1.0}],
+            "survey": {"plot_no": "1",
+                       "trees": {"云南松": {"6": {"height": 8, "count": 2}},
+                                 "其他阔叶": {"6": {"height": 8, "count": 2}}},
+                       "cut": {"6": 2}},
+            "track": [{"lat": 24.1, "lng": 102.1}, {"lat": 24.2, "lng": 102.2}],
+            "photo_count": 3,
+        }, {
+            "source_row": 2,
+            "fields": {"number": "XP-01"},      # 重名小班 → sheet 名必须去重
+            "species": [{"name": "云南松", "coefficient": 10.0}],
+            "survey": {}, "track": [], "photo_count": 0,
+        }]
+
+    def test_one_sheet_per_plot_with_readable_numbers(self):
+        buffer, count = build_project_workbook("设计总表.xlsx", self.schema, self.subs)
+        self.assertEqual(count, 2)
+        wb = load_workbook(buffer)
+        self.assertEqual(wb.sheetnames, ["XP-01", "XP-01(2)"])
+        ws = wb["XP-01"]
+        values = [cell for row in ws.iter_rows(values_only=True) for cell in row if cell is not None]
+        self.assertIn("小班号", values)
+        self.assertIn("弥勒村", values)
+        # 明细行：6 径阶 2 株 × 2 树种
+        self.assertEqual(values.count("云南松"), 1)
+        # 汇总：样地 4 株、蓄积 0.05（与 App 同一套口径）
+        self.assertIn(4, values)
+        self.assertIn(0.05, values)
+        self.assertIn(3, values)          # 照片数
+        self.assertIn(2, values)          # 轨迹点数
+
+    def test_unsurveyed_plot_is_explicit(self):
+        buffer, _ = build_project_workbook("设计总表.xlsx", self.schema, self.subs)
+        ws = load_workbook(buffer)["XP-01(2)"]
+        texts = [cell for row in ws.iter_rows(values_only=True) for cell in row if isinstance(cell, str)]
+        self.assertIn("本小班尚未录入调查数据", texts)
+
+
+class ExifTests(unittest.TestCase):
+    """前端 EXIF 纯逻辑（static/photo_exif.js）用 node 直跑，Python 侧只做看门。"""
+
+    @unittest.skipUnless(shutil.which("node"), "需要 node 才能跑 EXIF 用例")
+    def test_photo_exif_roundtrip(self):
+        script = ROOT / "tests" / "test_exif.js"
+        result = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0,
+                         (result.stdout or "")[-1000:] + (result.stderr or "")[-500:])
 
 
 if __name__ == "__main__":

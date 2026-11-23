@@ -31,7 +31,8 @@ echo "1/5 建目录并同步代码 → $REMOTE:$DEST"
 ssh "$REMOTE" "mkdir -p '$DEST/instance' '$GATEWAY/apps_root'"
 # 注意：--exclude 用 '/' 锚定，避免误伤同名子目录（supervision 踩坑固化）
 rsync -avz --exclude '__pycache__/' --exclude '*.pyc' --exclude '.DS_Store' \
-  ./app.py ./auth.py ./workbook.py ./param_parser.py ./calculations.py ./main.py ./requirements.txt \
+  ./app.py ./auth.py ./workbook.py ./param_parser.py ./calculations.py ./export_xlsx.py \
+  ./main.py ./requirements.txt \
   "$REMOTE:$DEST/"
 rsync -avz --exclude '__pycache__/' --exclude '.DS_Store' ./templates/ "$REMOTE:$DEST/templates/"
 rsync -avz --exclude '__pycache__/' --exclude '.DS_Store' ./static/ "$REMOTE:$DEST/static/"
