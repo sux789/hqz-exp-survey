@@ -45,7 +45,7 @@ jobs:
       - name: 上传 APK 工件
         uses: actions/upload-artifact@v4
         with:
-          name: 中幼林调查-debug-apk
+          name: 抚育调查-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30

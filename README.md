@@ -4,7 +4,7 @@ Excel 驱动的中幼林样地调查 App：管理员在 `/admin/` 上传调查�
 
 - **线上**：`https://forest.bibook.top/exp-survey/`（gateway 挂载，appspec 在 `deploy/`）
 - **本地**：`/usr/bin/python3 main.py` → <http://127.0.0.1:5000>
-- **App**：`top.bibook.expsurvey`「中幼林调查」，Capacitor 远程 URL 壳，网页更新无需重装
+- **App**：`top.bibook.expsurvey`「抚育调查」，Capacitor 远程 URL 壳，网页更新无需重装
 
 ## 账号与权限
 

@@ -60,10 +60,10 @@ jobs:
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          name: 中幼林调查 ${{ github.ref_name }}
+          name: 抚育调查 ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           body: |
-            中幼林抚育调查 App（Android 安装包）
+            抚育调查 App（Android 安装包）
 
             - 版本：${{ github.ref_name }}
             - 安装后打开即加载线上最新页面（远程 URL 壳，网页更新无需重装）
