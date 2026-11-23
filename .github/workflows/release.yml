@@ -68,5 +68,7 @@ jobs:
             - 版本：${{ github.ref_name }}
             - 安装后打开即加载线上最新页面（远程 URL 壳，网页更新无需重装）
             - appId：top.bibook.expsurvey
-          files: android/app/build/outputs/apk/release/*.apk
+          # 只传签名包；assembleRelease 在配置 signingConfig 后仍会留一份
+          # app-release-unsigned.apk，通配符会把它一起传上去误导用户
+          files: android/app/build/outputs/apk/release/app-release.apk
           fail_on_unmatched_files: true
