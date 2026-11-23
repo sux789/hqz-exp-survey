@@ -63,7 +63,17 @@
     <section id="detailView" class="page survey-page hidden">
       <div class="survey-heading">
         <div><p class="eyebrow">PLOT SURVEY</p><h1><span id="subcompartmentTitle"></span><span class="plot-label">样地表</span></h1><p id="subcompartmentMeta"></p></div>
-        <label class="plot-number">样地号<input id="plotNumber" type="text" maxlength="50" placeholder="输入样地号"></label>
+        <div class="plot-bar">
+          <div class="plot-bar-main">
+            <span class="plot-bar-label">样地</span>
+            <div id="plotChips" class="plot-chips" role="tablist" aria-label="样地号"></div>
+            <button id="addPlot" class="plot-add" type="button">＋ 新增样地</button>
+          </div>
+          <div class="plot-bar-side">
+            <label class="plot-rename">当前样地号<input id="plotNumber" type="text" maxlength="20" placeholder="如 1" autocomplete="off"></label>
+            <button id="deletePlot" class="plot-delete hidden" type="button">删除本样地</button>
+          </div>
+        </div>
       </div>
 
       <div class="summary-strip">

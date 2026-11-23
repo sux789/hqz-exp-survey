@@ -292,8 +292,8 @@ class ApiTests(unittest.TestCase):
         self.assertIn("spreadsheetml", response.headers["Content-Type"])
         self.assertIn(".xlsx", response.headers["Content-Disposition"])
         wb = load_workbook(io.BytesIO(response.data))
-        self.assertEqual(len(wb.sheetnames), 684)      # 每个小班一张 sheet
-        self.assertEqual(wb.sheetnames[0], "XP-01")
+        self.assertEqual(len(wb.sheetnames), 684)      # 每个小班默认一块样地 → 684 张 sheet
+        self.assertEqual(wb.sheetnames[0], "XP-01-1")  # sheet 名 = 小班号-样地号
         response.close()
 
     def test_project_uses_original_filename(self):
@@ -315,7 +315,6 @@ class ApiTests(unittest.TestCase):
     def test_survey_autosave_calculates_and_rejects_invalid_counts(self):
         sub_id = self.first_sub()
         payload = {
-            "plot_no": "1",
             "trees": {
                 "云南松": {"6": {"height": 8, "count": 2}},
                 "其他阔叶": {"6": {"height": 8, "count": 2}},
@@ -326,7 +325,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["summary"]["total_volume"], 0.05)
         saved = self.client.get(f"/api/subcompartments/{sub_id}").get_json()
-        self.assertEqual(saved["survey"]["plot_no"], "1")
+        self.assertEqual(len(saved["plots"]), 1)                 # 上传即自带一块样地
+        self.assertEqual(saved["plots"][0]["plot_no"], "1")      # 默认样地号 1
+        self.assertEqual(saved["plots"][0]["summary"]["plot_count"], 4)
+        self.assertTrue(saved["plots"][0]["has_survey"])
         payload["trees"]["云南松"]["6"]["count"] = 1.5
         response = self.client.put(f"/api/subcompartments/{sub_id}/survey", json=payload)
         self.assertEqual(response.status_code, 400)
@@ -368,8 +370,14 @@ class ApiTests(unittest.TestCase):
     # ── 覆盖更新 ────────────────────────────────────────────
     def test_update_keeps_survey_and_requires_name_confirm(self):
         sub_id = self.first_sub()
+        detail = self.client.get(f"/api/subcompartments/{sub_id}").get_json()
+        plot_id = detail["plots"][0]["id"]
+        # 样地号改成 7：v1.4 起号在样地行上，走 PATCH，不再塞在调查数据里
+        renamed = self.client.patch(f"/api/subcompartments/{sub_id}/plots/{plot_id}",
+                                    json={"plot_no": "7"})
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.get_json()["plot"]["plot_no"], "7")
         payload = {
-            "plot_no": "7",
             "trees": {"云南松": {"6": {"height": 9, "count": 3}}, "其他阔叶": {}},
             "cut": {"6": 1},
         }
@@ -400,8 +408,106 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(done.status_code, 200)
         self.assertTrue(done.get_json()["backup"].endswith(".json"))
         after = self.client.get(f"/api/subcompartments/{sub_id}").get_json()
-        self.assertEqual(after["survey"]["plot_no"], "7")
-        self.assertEqual(after["survey"]["trees"]["云南松"]["6"]["count"], 3)
+        self.assertEqual(after["plots"][0]["plot_no"], "7")   # 覆盖前改的样地号被保住
+        self.assertEqual(after["plots"][0]["survey"]["trees"]["云南松"]["6"]["count"], 3)
+
+    # ── 多块样地（v1.4）────────────────────────────────────
+    def test_multiple_plots_are_independent(self):
+        """一个小班多块样地：新增 → 各填各的 → 互不影响 → 改名 → 删除。"""
+        sub_id = self.first_sub()
+        first = self.client.get(f"/api/subcompartments/{sub_id}").get_json()["plots"][0]
+        self.assertEqual(first["plot_no"], "1")
+
+        added = self.client.post(f"/api/subcompartments/{sub_id}/plots", json={})
+        self.assertEqual(added.status_code, 201)
+        second = added.get_json()["plot"]
+        self.assertEqual(second["plot_no"], "2")           # 自动递增
+
+        self.client.put(f"/api/subcompartments/{sub_id}/plots/{first['id']}/survey", json={
+            "trees": {"云南松": {"6": {"height": 8, "count": 2}}}, "cut": {},
+        })
+        self.client.put(f"/api/subcompartments/{sub_id}/plots/{second['id']}/survey", json={
+            "trees": {"云南松": {"6": {"height": 9, "count": 3}}}, "cut": {"6": 1},
+        })
+
+        plots = self.client.get(f"/api/subcompartments/{sub_id}").get_json()["plots"]
+        self.assertEqual([plot["plot_no"] for plot in plots], ["1", "2"])
+        self.assertEqual(plots[0]["summary"]["plot_count"], 2)
+        self.assertEqual(plots[1]["summary"]["plot_count"], 3)
+        self.assertEqual(plots[1]["summary"]["cut_count"], 1)
+        self.assertTrue(all(plot["has_survey"] for plot in plots))
+
+        # 列表页要能直接看到每块样地号，才知道点哪个进
+        project = self.client.get(f"/api/projects/{self.project['id']}").get_json()
+        row = next(item for item in project["subcompartments"] if item["id"] == sub_id)
+        self.assertEqual([plot["plot_no"] for plot in row["plots"]], ["1", "2"])
+        self.assertTrue(row["has_survey"])
+
+        renamed = self.client.patch(f"/api/subcompartments/{sub_id}/plots/{second['id']}",
+                                    json={"plot_no": "2-1"})
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.get_json()["plot"]["plot_no"], "2-1")
+
+        removed = self.client.delete(f"/api/subcompartments/{sub_id}/plots/{second['id']}")
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual([plot["plot_no"] for plot in removed.get_json()["plots"]], ["1"])
+
+    def test_plot_number_is_unique_and_last_plot_is_protected(self):
+        sub_id = self.first_sub()
+        plot_id = self.client.get(f"/api/subcompartments/{sub_id}").get_json()["plots"][0]["id"]
+        self.client.post(f"/api/subcompartments/{sub_id}/plots", json={})
+
+        duplicate = self.client.patch(f"/api/subcompartments/{sub_id}/plots/{plot_id}",
+                                      json={"plot_no": "2"})
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertIn("已有样地号", duplicate.get_json()["error"])
+
+        empty = self.client.patch(f"/api/subcompartments/{sub_id}/plots/{plot_id}",
+                                  json={"plot_no": "   "})
+        self.assertEqual(empty.status_code, 400)
+        self.assertIn("不能为空", empty.get_json()["error"])
+
+        second = self.client.post(f"/api/subcompartments/{sub_id}/plots", json={}).get_json()["plot"]
+        self.assertEqual(second["plot_no"], "3")           # 中间插号也不撞
+        self.client.delete(f"/api/subcompartments/{sub_id}/plots/{second['id']}")
+
+        first_gone = self.client.delete(f"/api/subcompartments/{sub_id}/plots/{plot_id}")
+        self.assertEqual(first_gone.status_code, 200)
+        self.assertEqual([plot["plot_no"] for plot in first_gone.get_json()["plots"]], ["2"])
+        kept_id = first_gone.get_json()["plots"][0]["id"]
+
+        last = self.client.delete(f"/api/subcompartments/{sub_id}/plots/{kept_id}")
+        self.assertEqual(last.status_code, 400)
+        self.assertIn("至少要保留一个样地", last.get_json()["error"])
+
+    def test_plot_track_and_photos_are_per_plot(self):
+        project = self.upload("含轨迹.xlsx", workbook_with_params([
+            ["功能", "拍照;轨迹", "列表", "拍照", "打开轨迹", ""],
+        ]))
+        sub_id = self.client.get(f"/api/projects/{project['id']}").get_json()["subcompartments"][0]["id"]
+        detail = self.client.get(f"/api/subcompartments/{sub_id}").get_json()
+        first = detail["plots"][0]
+        second = self.client.post(f"/api/subcompartments/{sub_id}/plots", json={}).get_json()["plot"]
+
+        points = [
+            {"lat": 24.1, "lng": 102.1, "timestamp": 1700000000000, "accuracy": 5},
+            {"lat": 24.1001, "lng": 102.1001, "timestamp": 1700000001000, "accuracy": 4},
+        ]
+        saved = self.client.put(f"/api/subcompartments/{sub_id}/plots/{second['id']}/track",
+                                json={"points": points})
+        self.assertEqual(saved.status_code, 200)
+
+        plots = {plot["id"]: plot for plot in
+                 self.client.get(f"/api/subcompartments/{sub_id}").get_json()["plots"]}
+        self.assertEqual(plots[first["id"]]["track"], [])
+        self.assertEqual(len(plots[second["id"]]["track"]), 2)
+        self.assertGreater(plots[second["id"]]["track_distance"], 10)
+        self.assertEqual(
+            self.client.get(f"/api/subcompartments/{sub_id}/plots/{first['id']}/track.gpx").status_code,
+            400)   # 第一块没轨迹
+        gpx = self.client.get(f"/api/subcompartments/{sub_id}/plots/{second['id']}/track.gpx")
+        self.assertEqual(gpx.status_code, 200)
+        self.assertIn(b"XP-01-2", gpx.data)
 
     def test_param_sheet_upload_hides_track(self):
         project = self.upload("关闭轨迹.xlsx", workbook_with_params([
@@ -489,16 +595,17 @@ class ExportTests(unittest.TestCase):
                        "avg_dbh": 17.2, "avg_height": 10, "cut_method": "生长伐"},
             "species": [{"name": "云南松", "coefficient": 9.0},
                         {"name": "其他阔叶", "coefficient": 1.0}],
-            "survey": {"plot_no": "1",
-                       "trees": {"云南松": {"6": {"height": 8, "count": 2}},
+            "plot_no": "1",
+            "survey": {"trees": {"云南松": {"6": {"height": 8, "count": 2}},
                                  "其他阔叶": {"6": {"height": 8, "count": 2}}},
                        "cut": {"6": 2}},
             "track": [{"lat": 24.1, "lng": 102.1}, {"lat": 24.2, "lng": 102.2}],
             "photo_count": 3,
         }, {
             "source_row": 2,
-            "fields": {"number": "XP-01"},      # 重名小班 → sheet 名必须去重
+            "fields": {"number": "XP-01"},      # 重名小班 + 同样地号 → sheet 名必须去重
             "species": [{"name": "云南松", "coefficient": 10.0}],
+            "plot_no": "1",
             "survey": {}, "track": [], "photo_count": 0,
         }]
 
@@ -506,8 +613,8 @@ class ExportTests(unittest.TestCase):
         buffer, count = build_project_workbook("设计总表.xlsx", self.schema, self.subs)
         self.assertEqual(count, 2)
         wb = load_workbook(buffer)
-        self.assertEqual(wb.sheetnames, ["XP-01", "XP-01(2)"])
-        ws = wb["XP-01"]
+        self.assertEqual(wb.sheetnames, ["XP-01-1", "XP-01-1(2)"])
+        ws = wb["XP-01-1"]
         values = [cell for row in ws.iter_rows(values_only=True) for cell in row if cell is not None]
         self.assertIn("小班号", values)
         self.assertIn("弥勒村", values)
@@ -519,11 +626,41 @@ class ExportTests(unittest.TestCase):
         self.assertIn(3, values)          # 照片数
         self.assertIn(2, values)          # 轨迹点数
 
+    def test_plots_are_sorted_by_natural_order(self):
+        """sheet 顺序按已填的小班号 → 样地号自然序：XP-2 在 XP-10 前，样地 2 在样地 10 前。"""
+        subs = []
+        for number, plot_no in (("XP-10", "1"), ("XP-2", "10"), ("XP-2", "2")):
+            subs.append({
+                "source_row": len(subs) + 1,
+                "fields": {"number": number},
+                "species": [{"name": "云南松", "coefficient": 10.0}],
+                "plot_no": plot_no,
+                "survey": {}, "track": [], "photo_count": 0,
+            })
+        buffer, count = build_project_workbook("设计总表.xlsx", self.schema, subs)
+        self.assertEqual(count, 3)
+        self.assertEqual(load_workbook(buffer).sheetnames, ["XP-2-2", "XP-2-10", "XP-10-1"])
+
+    def test_two_plots_of_one_subcompartment_get_two_sheets(self):
+        """同一个小班两块样地 = 两张 sheet，各写各的样地号与数据。"""
+        base = dict(self.subs[0])
+        second = dict(base)
+        second["plot_no"] = "2"
+        second["survey"] = {"trees": {"云南松": {"6": {"height": 9, "count": 5}}}, "cut": {}}
+        second["track"] = []
+        buffer, count = build_project_workbook("设计总表.xlsx", self.schema, [base, second])
+        self.assertEqual(count, 2)
+        wb = load_workbook(buffer)
+        self.assertEqual(wb.sheetnames, ["XP-01-1", "XP-01-2"])
+        values = [cell for row in wb["XP-01-2"].iter_rows(values_only=True) for cell in row if cell is not None]
+        self.assertIn("2", values)
+        self.assertIn(5, values)        # 第二块样地 5 株，不串第一块的 4 株
+
     def test_unsurveyed_plot_is_explicit(self):
         buffer, _ = build_project_workbook("设计总表.xlsx", self.schema, self.subs)
-        ws = load_workbook(buffer)["XP-01(2)"]
+        ws = load_workbook(buffer)["XP-01-1(2)"]
         texts = [cell for row in ws.iter_rows(values_only=True) for cell in row if isinstance(cell, str)]
-        self.assertIn("本小班尚未录入调查数据", texts)
+        self.assertIn("本样地尚未录入调查数据", texts)
 
 
 class ExifTests(unittest.TestCase):

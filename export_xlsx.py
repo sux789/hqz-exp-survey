@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""全量导出：一个项目 → 一个 xlsx，每个小班一张 sheet。
+"""全量导出：一个项目 → 一个 xlsx，**每个小班的每块样地一张 sheet**。
 
-为什么这么切（C18）：
-- 外业交回来是「一张小班一张表」的签字习惯，按小班分 sheet 能直接打印归档；
-- 所有小班在一个文件里，管理员只需下载一次，不用逐个点。
+为什么这么切（C18/C19）：
+- 外业交回来是「一张表一块样地」的签字习惯，按小班×样地分 sheet 能直接打印归档；
+- 所有 sheet 在一个文件里，管理员只需下载一次，不用逐个点；
+- sheet 顺序按「小班号 → 样地号」自然序（XP-2 排在 XP-10 前面，样地 2 排在样地 10 前面），
+  与表里已经填写的号一致，找表靠号不用翻。
 
 单元格口径与 App 内完全一致（复用 calculations），不在导出里另算一套：
 单株材积 = ROUND(a × D^b × H^c, digits)，每公顷按样地表系数换算。
@@ -11,6 +13,7 @@
 """
 
 import io
+import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -34,9 +37,22 @@ THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def _sheet_name(fields, source_row, used):
-    """sheet 名：小班号优先；非法字符去掉，31 字截断，重名加序号。"""
-    raw = str(fields.get("number") or "").strip() or f"小班{source_row}"
+def natural(text):
+    """自然序键：把数字段按数值比（XP-2 < XP-10，样地 2 < 样地 10）。"""
+    return [int(part) if part.isdigit() else str(part).lower()
+            for part in re.split(r"(\d+)", str(text if text is not None else ""))]
+
+
+def sort_key(sheet):
+    """sheet 顺序：小班号 → 样地号 → 源表行号（都按已填写的号排）。"""
+    fields = sheet.get("fields") or {}
+    return (natural(fields.get("number")), natural(sheet.get("plot_no")), sheet.get("source_row") or 0)
+
+
+def _sheet_name(fields, plot_no, source_row, used):
+    """sheet 名：小班号-样地号；非法字符去掉，31 字截断，重名加序号。"""
+    number = str(fields.get("number") or "").strip() or f"小班{source_row}"
+    raw = f"{number}-{plot_no}" if plot_no else number
     clean = "".join("_" if ch in BAD_SHEET_CHARS else ch for ch in raw)[:31].strip() or f"小班{source_row}"
     name = clean
     index = 2
@@ -103,7 +119,7 @@ def _sheet_for(wb, sub, schema, filename, used):
     diameters = schema.get("diameters") or []
     visible = [item["name"] for item in species]
     summary = calculate_summary(survey, schema, visible)
-    ws = wb.create_sheet(_sheet_name(fields, sub.get("source_row"), used))
+    ws = wb.create_sheet(_sheet_name(fields, sub.get("plot_no"), sub.get("source_row"), used))
 
     _write_title(ws, filename)
     row = _write_pairs(ws, 4, [
@@ -115,7 +131,7 @@ def _sheet_for(wb, sub, schema, filename, used):
         ("平均胸径", fields.get("avg_dbh") or ""),
         ("平均树高", fields.get("avg_height") or ""),
         ("采伐方式", fields.get("cut_method") or ""),
-        ("样地号", survey.get("plot_no") or ""),
+        ("样地号", sub.get("plot_no") or ""),
     ])
     row += 1
 
@@ -143,7 +159,7 @@ def _sheet_for(wb, sub, schema, filename, used):
         for values in detail_rows:
             row = _write_row(ws, row, values, decimals={5: 3, 6: 3})
     else:
-        cell = ws.cell(row=row, column=1, value="本小班尚未录入调查数据" if not survey else "已录入，但没有株数/树高")
+        cell = ws.cell(row=row, column=1, value="本样地尚未录入调查数据" if not survey else "已录入，但没有株数/树高")
         cell.font = Font(italic=True, color="888888", size=10)
         row += 1
     row += 1
@@ -186,13 +202,18 @@ def _sheet_for(wb, sub, schema, filename, used):
 
 
 def build_project_workbook(filename, schema, subs):
-    """→ (BytesIO, sheet_count)。subs 每项含 fields/species/survey/track/photo_count/source_row。"""
+    """→ (BytesIO, sheet_count)。
+
+    subs 每项 = 一块样地：fields/species/plot_no/survey/track/photo_count/source_row。
+    按小班号、样地号自然序排序后再建 sheet，sheet 顺序即打印顺序。
+    """
     wb = Workbook()
     wb.remove(wb.active)          # 只用真实的 sheet，不留下空白的 Sheet
     used = set()
-    for sub in subs:
+    ordered = sorted(subs, key=sort_key)
+    for sub in ordered:
         _sheet_for(wb, sub, schema, filename, used)
-    if not subs:
+    if not ordered:
         ws = wb.create_sheet("无小班")
         ws["A1"] = "该项目还没有小班数据"
     buffer = io.BytesIO()

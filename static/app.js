@@ -3,7 +3,8 @@ const BASE = (document.querySelector('meta[name="exp-base"]')?.content || '').re
 const url = (path) => `${BASE}${path.startsWith('/') ? path : `/${path}`}`;
 const state = {
   me: null,
-  projects: [], project: null, detail: null, filters: { section: '', township: '', village: '', number: '' },
+  projects: [], project: null, detail: null, plotId: null,
+  filters: { section: '', township: '', village: '', number: '' },
   saveTimer: null, saveRevision: 0, saveInFlight: false, toastTimer: null,
   map: null, polyline: null, markers: [], trackPoints: [], watchId: null, recording: false,
   lastTrackAt: 0,
@@ -12,6 +13,7 @@ const state = {
 // 列表列：header 是 Excel 表头原文（用于匹配「不显示列」），label 是界面显示
 const COLUMNS = [
   { header: '小班号', label: '小班号', field: 'number' },
+  { header: '样地号', label: '样地号', field: 'plots' },
   { header: '村委会', label: '村委会', field: 'village' },
   { header: '小班面积', label: '面积（亩）', field: 'area' },
   { header: '树种组成', label: '树种组成', field: 'composition' },
@@ -201,15 +203,39 @@ function renderSubcompartments() {
       if (column.field === 'number') {
         return `<td><button class="sub-link" type="button" data-sub-id="${row.id}">${escapeHtml(fields.number)}</button></td>`;
       }
+      if (column.field === 'plots') {
+        // 样地号直接可点：点哪块进哪块，＋ 就地新增，不用先进详情页
+        const chips = (row.plots || []).map((plot) => `<button class="plot-chip ${plot.has_survey ? 'done' : ''}" type="button" data-sub-id="${row.id}" data-plot-id="${plot.id}">${escapeHtml(plot.plot_no)}</button>`).join('');
+        return `<td class="plot-cell">${chips}<button class="plot-chip add" type="button" data-add-sub="${row.id}" title="新增样地">＋</button></td>`;
+      }
       if (column.field === 'status') {
-        return `<td><span class="status-pill ${row.has_survey ? 'done' : ''}">${row.has_survey ? '已调查' : '待调查'}</span></td>`;
+        const total = row.plots?.length || 0;
+        const done = (row.plots || []).filter((plot) => plot.has_survey).length;
+        return `<td><span class="status-pill ${done ? 'done' : ''}">${done ? `${done}/${total} 已调查` : `待调查（${total} 块）`}</span></td>`;
       }
       return `<td>${escapeHtml(fields[column.field] ?? '—')}</td>`;
     }).join('');
     return `<tr>${cells}</tr>`;
   }).join('');
   $('#subcompartmentRows').querySelectorAll('[data-sub-id]').forEach((button) => {
-    button.addEventListener('click', () => navigate(`#/sub/${button.dataset.subId}`));
+    button.addEventListener('click', () => navigate(
+      button.dataset.plotId ? `#/sub/${button.dataset.subId}/${button.dataset.plotId}` : `#/sub/${button.dataset.subId}`));
+  });
+  $('#subcompartmentRows').querySelectorAll('[data-add-sub]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        const data = await api(`/api/subcompartments/${button.dataset.addSub}/plots`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        toast(`已新增样地 ${data.plot.plot_no}`);
+        navigate(`#/sub/${button.dataset.addSub}/${data.plot.id}`);
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
   });
 }
 
@@ -221,19 +247,34 @@ function emptySurvey(detail) {
   });
   const cut = {};
   detail.schema.diameters.forEach((dbh) => { cut[dbh] = 0; });
-  return { plot_no: '', trees, cut };
+  return { trees, cut };
 }
 
-async function loadDetail(subId) {
+/** 当前正在填的那块样地（一个小班可以有多块）。 */
+function currentPlot() {
+  const plots = state.detail?.plots || [];
+  return plots.find((plot) => plot.id === state.plotId) || plots[0] || null;
+}
+
+/** 后端给的空样地没有 trees 骨架，这里补上，避免渲染时空指针。 */
+function plotSurveyReady(detail, plot) {
+  if (!plot) return;
+  if (!plot.survey?.trees || !Object.keys(plot.survey.trees).length) {
+    plot.survey = emptySurvey(detail);
+  }
+}
+
+async function loadDetail(subId, plotId) {
   stopTracking(false);
   showView('detail');
   $('#pageSubtitle').textContent = '样地调查';
   $('#surveyTable').innerHTML = '';
   try {
     state.detail = await api(`/api/subcompartments/${subId}`);
-    if (!state.detail.survey?.trees || !Object.keys(state.detail.survey.trees).length) {
-      state.detail.survey = emptySurvey(state.detail);
-    }
+    const plots = state.detail.plots || [];
+    const wanted = Number(plotId);
+    state.plotId = (plots.find((plot) => plot.id === wanted) || plots[0])?.id ?? null;
+    plots.forEach((plot) => plotSurveyReady(state.detail, plot));
     renderDetail();
     if (state.detail.params?.has_track !== false) initTrackMap();
   } catch (error) {
@@ -243,17 +284,104 @@ async function loadDetail(subId) {
   }
 }
 
+/** 样地条：当前样地实心绿，非当前灰色；已填过的加浅底提示。 */
+function renderPlotBar() {
+  const plots = state.detail?.plots || [];
+  $('#plotChips').innerHTML = plots.map((plot) => `
+    <button class="plot-chip ${plot.id === state.plotId ? 'active' : ''} ${plot.has_survey ? 'done' : ''}"
+      type="button" role="tab" aria-selected="${plot.id === state.plotId}" data-plot="${plot.id}"
+      title="样地 ${escapeHtml(plot.plot_no)}${plot.has_survey ? '（已调查）' : '（未调查）'}">${escapeHtml(plot.plot_no)}</button>`).join('');
+  $('#plotChips').querySelectorAll('[data-plot]').forEach((button) => {
+    button.addEventListener('click', () => switchPlot(Number(button.dataset.plot)));
+  });
+  $('#deletePlot').classList.toggle('hidden', plots.length <= 1);
+}
+
+/** 切样地：先把当前样地的调查/轨迹落盘，再换数据，避免串数据。 */
+async function switchPlot(plotId) {
+  if (!state.detail || !plotId || plotId === state.plotId) return;
+  if (state.saveTimer) {
+    clearTimeout(state.saveTimer);
+    await saveSurvey();
+  }
+  stopTracking(true);
+  state.plotId = plotId;
+  const plot = currentPlot();
+  plotSurveyReady(state.detail, plot);
+  renderDetail();
+  if (state.detail.params?.has_track !== false) initTrackMap();
+  history.replaceState(null, '', `#/sub/${state.detail.id}/${plotId}`);
+}
+
+async function addPlot() {
+  if (!state.detail) return;
+  try {
+    const data = await api(`/api/subcompartments/${state.detail.id}/plots`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    plotSurveyReady(state.detail, data.plot);
+    state.detail.plots.push(data.plot);
+    toast(`已新增样地 ${data.plot.plot_no}`);
+    await switchPlot(data.plot.id);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function renamePlot(value) {
+  const plot = currentPlot();
+  if (!plot) return;
+  const text = String(value || '').trim();
+  if (!text || text === plot.plot_no) {
+    $('#plotNumber').value = plot.plot_no;
+    return;
+  }
+  try {
+    const data = await api(`/api/subcompartments/${state.detail.id}/plots/${plot.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plot_no: text }),
+    });
+    plot.plot_no = data.plot.plot_no;
+    $('#plotNumber').value = plot.plot_no;
+    renderPlotBar();
+    toast(`样地号已改为 ${plot.plot_no}`);
+  } catch (error) {
+    $('#plotNumber').value = plot.plot_no;   // 失败回退到旧号，避免界面和库里不一致
+    toast(error.message, true);
+  }
+}
+
+async function deletePlot() {
+  const plot = currentPlot();
+  const plots = state.detail?.plots || [];
+  if (!plot || plots.length <= 1) return;
+  const warn = `确认删除样地 ${plot.plot_no}？\n该样地的调查数据、照片、轨迹会一起删除，无法恢复。`;
+  if (!window.confirm(warn)) return;
+  try {
+    await api(`/api/subcompartments/${state.detail.id}/plots/${plot.id}`, { method: 'DELETE' });
+    state.detail.plots = plots.filter((item) => item.id !== plot.id);
+    state.plotId = state.detail.plots[0]?.id ?? null;
+    renderDetail();
+    if (state.detail.params?.has_track !== false) initTrackMap();
+    toast(`已删除样地 ${plot.plot_no}`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function renderDetail() {
   const detail = state.detail;
+  const plot = currentPlot();
   const fields = detail.fields;
   $('#subcompartmentTitle').textContent = fields.number;
   $('#subcompartmentMeta').textContent = [fields.section, fields.township, fields.village, `小班面积 ${fields.area ?? '—'} 亩`].filter(Boolean).join(' · ');
-  $('#plotNumber').value = detail.survey.plot_no || '';
+  renderPlotBar();
+  $('#plotNumber').value = plot?.plot_no || '';
   $('#speciesChips').innerHTML = detail.species.map((item) => `<span class="species-chip">${item.coefficient}${escapeHtml(item.name)}</span>`).join('');
   renderSurveyTable();
   recalculateSurvey();
   renderPhotos();
-  state.trackPoints = detail.track || [];
+  state.trackPoints = (plot?.track || []).slice();
   const cached = readTrackCache();
   if (cached.length > state.trackPoints.length) state.trackPoints = cached;
   applyParamsToDetail();
@@ -282,7 +410,8 @@ function countControl(type, species, dbh, value) {
 }
 
 function renderSurveyTable() {
-  const { schema, species, survey } = state.detail;
+  const { schema, species } = state.detail;
+  const survey = currentPlot().survey;
   let html = '<thead><tr><th class="dbh-cell" rowspan="2">胸径<br>(cm)</th>';
   species.forEach(({ name }) => { html += `<th colspan="2">${escapeHtml(name)}</th>`; });
   html += '<th class="cut-head" colspan="2">采伐</th>';
@@ -325,8 +454,10 @@ function unitVolume(params, dbh, height) {
 
 function recalculateSurvey() {
   const detail = state.detail;
-  if (!detail) return;
-  const { schema, species, survey } = detail;
+  const plot = currentPlot();
+  if (!detail || !plot) return;
+  const { schema, species } = detail;
+  const survey = plot.survey;
   let plotCount = 0;
   let weightedSquares = 0;
   let allVolume = 0;
@@ -384,18 +515,24 @@ function scheduleSurveySave() {
 
 async function saveSurvey() {
   if (!state.detail || state.saveInFlight) return;
+  const plot = currentPlot();
+  if (!plot) return;
   clearTimeout(state.saveTimer);
+  state.saveTimer = null;
   const detailId = state.detail.id;
+  const plotId = plot.id;
   const revision = state.saveRevision;
-  const payload = JSON.stringify(state.detail.survey);
+  const payload = JSON.stringify(plot.survey);
   state.saveInFlight = true;
   setSaveStatus('保存中…', 'saving');
   try {
-    const data = await api(`/api/subcompartments/${detailId}/survey`, {
+    const data = await api(`/api/subcompartments/${detailId}/plots/${plotId}/survey`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: payload,
     });
-    if (state.detail?.id === detailId && revision === state.saveRevision) {
-      state.detail.survey = data.survey;
+    if (revision === state.saveRevision && plot.id === plotId) {
+      plot.survey = data.survey;
+      plot.summary = data.summary;
+      plot.has_survey = data.has_survey;
       setSaveStatus('已自动保存');
     }
   } catch (error) {
@@ -403,31 +540,34 @@ async function saveSurvey() {
     toast(`调查数据保存失败：${error.message}`, true);
   } finally {
     state.saveInFlight = false;
-    if (state.detail && (state.detail.id !== detailId || revision !== state.saveRevision)) saveSurvey();
+    if (state.detail && revision !== state.saveRevision) saveSurvey();
   }
 }
 
 function updateSurveyInput(input) {
+  const plot = currentPlot();
+  if (!plot) return;
+  const survey = plot.survey;
   const { type, species, dbh } = input.dataset;
   if (type === 'cut') {
     const value = Math.max(0, Math.round(Number(input.value) || 0));
     input.value = value;
-    state.detail.survey.cut[dbh] = value;
+    survey.cut[dbh] = value;
   } else if (type === 'count') {
     const value = Math.max(0, Math.round(Number(input.value) || 0));
     input.value = value;
-    state.detail.survey.trees[species][dbh].count = value;
+    survey.trees[species][dbh].count = value;
   } else {
     const value = input.value === '' ? null : Math.max(0, Number(input.value) || 0);
     input.value = value ?? '';
-    state.detail.survey.trees[species][dbh].height = value;
+    survey.trees[species][dbh].height = value;
   }
   recalculateSurvey();
   scheduleSurveySave();
 }
 
 function renderPhotos() {
-  const photos = state.detail?.photos || [];
+  const photos = currentPlot()?.photos || [];
   $('#photoList').innerHTML = photos.length ? photos.map((photo) => `
     <a class="photo-item" href="${photo.url}" target="_blank" rel="noopener"><img src="${photo.url}" alt="样地照片" loading="lazy"><span>${(photo.compressed_size / 1024).toFixed(0)} KB · ${formatDate(photo.created_at)}</span></a>`).join('') : '<span class="inline-status">暂无照片</span>';
 }
@@ -514,7 +654,12 @@ async function compressPhoto(file, coordinates, takenAt) {
   const lines = [];
   if (marks.includes('时间')) lines.push(`时间：${stamp}`);
   if (marks.includes('坐标')) lines.push(`坐标：${coordinates || '定位未获取'}`);
-  if (marks.includes('小班')) lines.push(`小班：${state.detail.fields.number}`);
+  if (marks.includes('小班')) {
+    const plot = currentPlot();
+    lines.push(plot && plot.plot_no !== '1'
+      ? `小班：${state.detail.fields.number}  样地：${plot.plot_no}`
+      : `小班：${state.detail.fields.number}`);
+  }
   if (lines.length) {
     let fontSize = Math.max(18, Math.round(canvas.width / 34));
     let lineHeight = Math.round(fontSize * 1.45);
@@ -580,11 +725,13 @@ async function handlePhoto(file) {
       : await currentCoordinates();
     const blob = await keepExif(file, await compressPhoto(file, coordinates, meta && meta.takenAt));
     $('#photoStatus').textContent = `已压缩 ${(file.size / 1024).toFixed(0)} KB → ${(blob.size / 1024).toFixed(0)} KB，正在上传…`;
+    const plot = currentPlot();
+    if (!plot) throw new Error('当前小班还没有样地');
     const form = new FormData();
-    form.append('file', blob, `${state.detail.fields.number}_${Date.now()}.jpg`);
+    form.append('file', blob, `${state.detail.fields.number}_样地${plot.plot_no}_${Date.now()}.jpg`);
     form.append('original_size', file.size);
-    const data = await api(`/api/subcompartments/${state.detail.id}/photos`, { method: 'POST', body: form });
-    state.detail.photos.unshift(data.photo);
+    const data = await api(`/api/subcompartments/${state.detail.id}/plots/${plot.id}/photos`, { method: 'POST', body: form });
+    plot.photos.unshift(data.photo);
     renderPhotos();
     $('#photoStatus').textContent = `已保存，压缩 ${Math.max(0, Math.round((1 - blob.size / file.size) * 100))}%`
       + (meta ? '，EXIF 已保留' : '');
@@ -599,7 +746,7 @@ async function handlePhoto(file) {
 }
 
 function trackCacheKey() {
-  return state.detail ? `forest_track_${state.detail.id}` : '';
+  return state.detail && state.plotId ? `forest_track_plot_${state.plotId}` : '';
 }
 
 function readTrackCache() {
@@ -645,7 +792,8 @@ function updateTrackUI(fit = false) {
   const exportLink = $('#exportTrack');
   exportLink.classList.toggle('disabled', !points.length);
   exportLink.setAttribute('aria-disabled', points.length ? 'false' : 'true');
-  exportLink.href = points.length ? url(`/api/subcompartments/${state.detail.id}/track.gpx`) : '#';
+  exportLink.href = points.length && currentPlot()
+    ? url(`/api/subcompartments/${state.detail.id}/plots/${currentPlot().id}/track.gpx`) : '#';
   if (state.polyline) {
     const latLngs = points.map((point) => [point.lat, point.lng]);
     state.polyline.setLatLngs(latLngs);
@@ -710,15 +858,17 @@ function stopTracking(save = true) {
 }
 
 async function saveTrack(notify = true) {
-  if (!state.detail) return;
+  const plot = currentPlot();
+  if (!state.detail || !plot) return;
   const subId = state.detail.id;
+  const plotId = plot.id;
   $('#trackStatus').textContent = '正在保存轨迹…';
   try {
-    const data = await api(`/api/subcompartments/${subId}/track`, {
+    const data = await api(`/api/subcompartments/${subId}/plots/${plotId}/track`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ points: state.trackPoints }),
     });
-    if (state.detail?.id === subId) {
-      state.detail.track = data.points;
+    if (plot.id === plotId) {
+      plot.track = data.points;
       $('#trackStatus').textContent = `轨迹已保存，共 ${data.points.length} 个定位点。`;
     }
     if (notify) toast('卫星轨迹已保存');
@@ -732,8 +882,8 @@ async function handleRoute() {
   clearTimeout(state.saveTimer);
   const hash = location.hash || '#/';
   const projectMatch = hash.match(/^#\/project\/([a-f0-9]+)$/);
-  const subMatch = hash.match(/^#\/sub\/(\d+)$/);
-  if (subMatch) await loadDetail(subMatch[1]);
+  const subMatch = hash.match(/^#\/sub\/(\d+)(?:\/(\d+))?$/);
+  if (subMatch) await loadDetail(subMatch[1], subMatch[2]);
   else if (projectMatch) await loadProject(projectMatch[1]);
   else await loadProjects();
 }
@@ -778,11 +928,12 @@ $('#surveyTable').addEventListener('click', (event) => {
   input.value = Math.max(0, (Number(input.value) || 0) + Number(button.dataset.step));
   updateSurveyInput(input);
 });
-$('#plotNumber').addEventListener('input', (event) => {
-  if (!state.detail) return;
-  state.detail.survey.plot_no = event.target.value;
-  scheduleSurveySave();
+$('#plotNumber').addEventListener('change', (event) => renamePlot(event.target.value));
+$('#plotNumber').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); event.target.blur(); }
 });
+$('#addPlot').addEventListener('click', addPlot);
+$('#deletePlot').addEventListener('click', deletePlot);
 $('#takePhoto').addEventListener('click', () => $('#photoInput').click());
 $('#photoInput').addEventListener('change', (event) => handlePhoto(event.target.files[0]));
 $('#toggleTrack').addEventListener('click', () => state.recording ? stopTracking(true) : startTracking());

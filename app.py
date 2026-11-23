@@ -71,9 +71,21 @@ CREATE TABLE IF NOT EXISTS subcompartments (
     track_json TEXT NOT NULL DEFAULT '[]',
     UNIQUE(project_id, source_row)
 );
+-- 样地（一个小班里可以有多块样地，v1.4）：调查数据/轨迹/照片都挂在样地上，
+-- 小班行只留基础数据。老库由 ensure_plots() 把原 survey/track/照片迁到样地 1。
+CREATE TABLE IF NOT EXISTS plots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subcompartment_id INTEGER NOT NULL REFERENCES subcompartments(id) ON DELETE CASCADE,
+    plot_no TEXT NOT NULL,
+    survey_json TEXT NOT NULL DEFAULT '{}',
+    track_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(subcompartment_id, plot_no)
+);
 CREATE TABLE IF NOT EXISTS photos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     subcompartment_id INTEGER NOT NULL REFERENCES subcompartments(id) ON DELETE CASCADE,
+    plot_id INTEGER REFERENCES plots(id) ON DELETE CASCADE,
     filename TEXT NOT NULL,
     original_size INTEGER NOT NULL,
     compressed_size INTEGER NOT NULL,
@@ -85,12 +97,13 @@ MIGRATIONS = (
     ("projects", "uploader", "TEXT NOT NULL DEFAULT ''"),
     ("projects", "params_json", "TEXT NOT NULL DEFAULT '{}'"),
     ("projects", "is_active", "INTEGER NOT NULL DEFAULT 1"),
+    ("photos", "plot_id", "INTEGER"),
 )
 
 # 静态资源版本：每次发版递增，模板把它拼到 ?v= 上。
 # 原因：Capacitor WebView 会把 app.js 缓存到本地，HTML 改了但 JS 还是旧的 →
 # 旧页面继续 POST 已删除的 /api/login，拿到 404 HTML 就报 "is not valid JSON"。
-ASSET_VERSION = "v1.3.1"
+ASSET_VERSION = "v1.4.0"
 
 
 def parse_blob(filename, blob):
@@ -185,8 +198,42 @@ def create_app(prefix="", test_config=None):
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         db.commit()
 
+    def ensure_plots(db):
+        """v1.4 迁移：每个小班至少有一个样地。
+
+        老库把调查数据/轨迹存在小班行上，这里原样搬进「样地 1」（若原来填过样地号就用它），
+        并把没有归属的老照片指到该样地。幂等：已有样地的小班不会被重复处理。
+        """
+        rows = db.execute(
+            "SELECT s.id, s.survey_json, s.track_json FROM subcompartments s"
+            " WHERE NOT EXISTS (SELECT 1 FROM plots p WHERE p.subcompartment_id = s.id)"
+        ).fetchall()
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        with db:
+            for row in rows:
+                try:
+                    survey = json.loads(row["survey_json"] or "{}")
+                except (TypeError, ValueError):
+                    survey = {}
+                number = str(survey.get("plot_no") or "").strip()[:20] or "1"
+                db.execute(
+                    "INSERT INTO plots (subcompartment_id, plot_no, survey_json, track_json, created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (row["id"], number, row["survey_json"] or "{}", row["track_json"] or "[]", now),
+                )
+            db.execute("""
+                UPDATE photos SET plot_id = (
+                    SELECT p.id FROM plots p WHERE p.subcompartment_id = photos.subcompartment_id
+                    ORDER BY p.id LIMIT 1)
+                WHERE plot_id IS NULL
+            """)
+        return len(rows)
+
     with app.app_context():
         init_db()
+        ensure_plots(get_db())
 
     # ── 序列化 ────────────────────────────────────────────────
     def params_of(row):
@@ -215,19 +262,58 @@ def create_app(prefix="", test_config=None):
             "params": params_of(row),
         }
 
-    def sub_summary(row):
-        survey = json.loads(row["survey_json"])
-        has_survey = bool(survey.get("plot_no")) or any(
+    def photo_json(photo):
+        return {
+            "id": photo["id"],
+            "url": f"photos/{photo['id']}",
+            "original_size": photo["original_size"],
+            "compressed_size": photo["compressed_size"],
+            "created_at": photo["created_at"],
+        }
+
+    def survey_filled(survey):
+        return any(
             values.get("count") or values.get("height")
-            for species in survey.get("trees", {}).values()
+            for species in (survey.get("trees") or {}).values()
             for values in species.values()
         )
+
+    def plots_of(sub_id):
+        return get_db().execute(
+            "SELECT * FROM plots WHERE subcompartment_id = ? ORDER BY id", (sub_id,)
+        ).fetchall()
+
+    def plot_json(row, schema=None, visible=None):
+        survey = json.loads(row["survey_json"] or "{}")
+        track = json.loads(row["track_json"] or "[]")
+        photos = get_db().execute(
+            "SELECT * FROM photos WHERE plot_id = ? ORDER BY id DESC", (row["id"],)
+        ).fetchall()
+        payload = {
+            "id": row["id"],
+            "subcompartment_id": row["subcompartment_id"],
+            "plot_no": row["plot_no"],
+            "survey": survey,
+            "has_survey": survey_filled(survey),
+            "track": track,
+            "track_distance": haversine_distance(track),
+            "photos": [photo_json(photo) for photo in photos],
+            "photo_count": len(photos),
+        }
+        if schema is not None:
+            payload["summary"] = calculate_summary(survey, schema, visible or [])
+        return payload
+
+    def sub_summary(row, plots=()):
         return {
             "id": row["id"],
             "source_row": row["source_row"],
             "fields": json.loads(row["fields_json"]),
             "species": json.loads(row["species_json"]),
-            "has_survey": has_survey,
+            "has_survey": any(plot["has_survey"] for plot in plots),
+            "plots": [{
+                "id": plot["id"], "plot_no": plot["plot_no"], "has_survey": plot["has_survey"],
+            } for plot in plots],
         }
 
     def get_subcompartment(sub_id):
@@ -242,12 +328,10 @@ def create_app(prefix="", test_config=None):
 
     def sub_detail(row):
         schema = json.loads(row["schema_json"])
-        survey = json.loads(row["survey_json"])
         species = json.loads(row["species_json"])
-        photos = get_db().execute(
-            "SELECT * FROM photos WHERE subcompartment_id = ? ORDER BY id DESC", (row["id"],)
-        ).fetchall()
-        track = json.loads(row["track_json"])
+        visible = [item["name"] for item in species]
+        plots = [plot_json(plot, schema, visible) for plot in plots_of(row["id"])]
+        first = plots[0]
         return {
             "id": row["id"],
             "project_id": row["project_id"],
@@ -258,17 +342,14 @@ def create_app(prefix="", test_config=None):
             "species": species,
             "schema": schema,
             "params": params_of(row),
-            "survey": survey,
-            "summary": calculate_summary(survey, schema, [item["name"] for item in species]),
-            "track": track,
-            "track_distance": haversine_distance(track),
-            "photos": [{
-                "id": photo["id"],
-                "url": f"photos/{photo['id']}",
-                "original_size": photo["original_size"],
-                "compressed_size": photo["compressed_size"],
-                "created_at": photo["created_at"],
-            } for photo in photos],
+            "plots": plots,
+            # 兼容旧页面：不指定样地时就是第一个样地
+            "plot": first,
+            "survey": first["survey"],
+            "summary": first["summary"],
+            "track": first["track"],
+            "track_distance": first["track_distance"],
+            "photos": first["photos"],
         }
 
     # ── 页面 ──────────────────────────────────────────────────
@@ -340,14 +421,27 @@ def create_app(prefix="", test_config=None):
     @bp.get("/api/projects/<project_id>")
     @auth.login_required
     def project_detail(project_id):
-        project = get_db().execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        db = get_db()
+        project = db.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if project is None:
             raise WorkbookError("项目不存在")
-        rows = get_db().execute(
+        rows = db.execute(
             "SELECT * FROM subcompartments WHERE project_id = ? ORDER BY source_row", (project_id,)
         ).fetchall()
+        # 列表页要显示每个小班已填的样地号，一次查全项目再分组，避免 684 次子查询
+        grouped = {}
+        for plot in db.execute("""
+            SELECT p.id, p.subcompartment_id, p.plot_no, p.survey_json
+            FROM plots p JOIN subcompartments s ON s.id = p.subcompartment_id
+            WHERE s.project_id = ? ORDER BY p.subcompartment_id, p.id
+        """, (project_id,)).fetchall():
+            grouped.setdefault(plot["subcompartment_id"], []).append({
+                "id": plot["id"],
+                "plot_no": plot["plot_no"],
+                "has_survey": survey_filled(json.loads(plot["survey_json"] or "{}")),
+            })
         result = project_json(project)
-        result["subcompartments"] = [sub_summary(row) for row in rows]
+        result["subcompartments"] = [sub_summary(row, grouped.get(row["id"], [])) for row in rows]
         return jsonify(result)
 
     @bp.get("/api/projects/<project_id>/export.xlsx")
@@ -361,21 +455,34 @@ def create_app(prefix="", test_config=None):
         rows = db.execute(
             "SELECT * FROM subcompartments WHERE project_id = ? ORDER BY source_row", (project_id,)
         ).fetchall()
-        counts = dict(db.execute(
-            "SELECT s.id, COUNT(p.id) FROM subcompartments s"
-            " JOIN photos p ON p.subcompartment_id = s.id"
-            " WHERE s.project_id = ? GROUP BY s.id", (project_id,)
-        ).fetchall())
-        subs = [{
-            "source_row": row["source_row"],
-            "fields": json.loads(row["fields_json"]),
-            "species": json.loads(row["species_json"]),
-            "survey": json.loads(row["survey_json"]),
-            "track": json.loads(row["track_json"]),
-            "photo_count": counts.get(row["id"], 0),
-        } for row in rows]
+        counts = dict(db.execute("""
+            SELECT p.id, COUNT(ph.id) FROM plots p
+            JOIN subcompartments s ON s.id = p.subcompartment_id
+            LEFT JOIN photos ph ON ph.plot_id = p.id
+            WHERE s.project_id = ? GROUP BY p.id
+        """, (project_id,)).fetchall())
+        by_sub = {}
+        for plot in db.execute("""
+            SELECT p.* FROM plots p JOIN subcompartments s ON s.id = p.subcompartment_id
+            WHERE s.project_id = ? ORDER BY p.subcompartment_id, p.id
+        """, (project_id,)).fetchall():
+            by_sub.setdefault(plot["subcompartment_id"], []).append(plot)
+        sheets = []
+        for row in rows:
+            fields = json.loads(row["fields_json"])
+            species = json.loads(row["species_json"])
+            for plot in by_sub.get(row["id"], []):
+                sheets.append({
+                    "source_row": row["source_row"],
+                    "fields": fields,
+                    "species": species,
+                    "plot_no": plot["plot_no"],
+                    "survey": json.loads(plot["survey_json"] or "{}"),
+                    "track": json.loads(plot["track_json"] or "[]"),
+                    "photo_count": counts.get(plot["id"], 0),
+                })
         buffer, sheet_count = build_project_workbook(
-            project["filename"], json.loads(project["schema_json"]), subs)
+            project["filename"], json.loads(project["schema_json"]), sheets)
         stem = Path(project["filename"]).stem or "样地"
         name = f"{stem}_样地明细_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         app.logger.info("导出项目 %s：%s 张 sheet", project_id, sheet_count)
@@ -406,11 +513,48 @@ def create_app(prefix="", test_config=None):
             return int(result)
         return result
 
-    @bp.put("/api/subcompartments/<int:sub_id>/survey")
-    @auth.login_required
-    def save_survey(sub_id):
-        row = get_subcompartment(sub_id)
-        payload = request.get_json(silent=True)
+    # ── 样地：一个小班可以有多块样地（v1.4）──────────────────
+    def get_plot(sub_id, plot_id):
+        plot = get_db().execute(
+            "SELECT * FROM plots WHERE id = ? AND subcompartment_id = ?", (plot_id, sub_id)
+        ).fetchone()
+        if plot is None:
+            raise WorkbookError("样地不存在")
+        return plot
+
+    def first_plot(sub_id):
+        plot = get_db().execute(
+            "SELECT * FROM plots WHERE subcompartment_id = ? ORDER BY id LIMIT 1", (sub_id,)
+        ).fetchone()
+        if plot is None:
+            raise WorkbookError("该小班还没有样地，请先新增样地")
+        return plot
+
+    def clean_plot_no(value):
+        text = str(value if value is not None else "").strip()
+        if not text:
+            raise WorkbookError("样地号不能为空")
+        if len(text) > 20:
+            raise WorkbookError("样地号最多 20 个字符")
+        if any(ord(char) < 32 for char in text):
+            raise WorkbookError("样地号不能包含换行等控制字符")
+        return text
+
+    def next_plot_no(sub_id):
+        """默认新样地号：已有纯数字号的最大值 +1，没有就按个数 +1。"""
+        numbers = [plot["plot_no"] for plot in plots_of(sub_id)]
+        numeric = [int(text) for text in numbers if text.isdigit()]
+        candidate = (max(numeric) + 1) if numeric else (len(numbers) + 1)
+        while str(candidate) in numbers:
+            candidate += 1
+        return str(candidate)
+
+    def plot_payload(row, plot_row):
+        schema = json.loads(row["schema_json"])
+        visible = [item["name"] for item in json.loads(row["species_json"])]
+        return plot_json(plot_row, schema, visible)
+
+    def clean_survey(payload, row):
         if not isinstance(payload, dict):
             raise WorkbookError("调查数据格式不正确")
         schema = json.loads(row["schema_json"])
@@ -439,20 +583,25 @@ def create_app(prefix="", test_config=None):
         if set(raw_cut) - diameters:
             raise WorkbookError("采伐株数包含固定范围外的胸径项")
         cut = {dbh: numeric(raw_cut.get(dbh), f"采伐 {dbh}cm 株数", integer=True) for dbh in diameters}
-        survey = {"plot_no": str(payload.get("plot_no", "")).strip()[:50], "trees": trees, "cut": cut}
-        summary = calculate_summary(survey, schema, visible)
+        survey = {"trees": trees, "cut": cut}
+        return survey, calculate_summary(survey, schema, visible)
+
+    def store_plot_survey(sub_id, plot_id):
+        row = get_subcompartment(sub_id)
+        get_plot(sub_id, plot_id)
+        survey, summary = clean_survey(request.get_json(silent=True), row)
         db = get_db()
         with db:
             db.execute(
-                "UPDATE subcompartments SET survey_json = ? WHERE id = ?",
-                (json.dumps(survey, ensure_ascii=False), sub_id),
+                "UPDATE plots SET survey_json = ? WHERE id = ?",
+                (json.dumps(survey, ensure_ascii=False), plot_id),
             )
-        return jsonify({"survey": survey, "summary": summary})
+        return jsonify({"plot_id": plot_id, "survey": survey, "summary": summary,
+                        "has_survey": survey_filled(survey)})
 
-    @bp.post("/api/subcompartments/<int:sub_id>/photos")
-    @auth.login_required
-    def upload_photo(sub_id):
+    def store_plot_photo(sub_id, plot_id):
         get_subcompartment(sub_id)
+        get_plot(sub_id, plot_id)
         upload = request.files.get("file")
         if upload is None or not upload.filename:
             raise WorkbookError("请选择照片")
@@ -466,39 +615,24 @@ def create_app(prefix="", test_config=None):
         except ValueError as exc:
             raise WorkbookError("原始照片大小不正确") from exc
         filename = f"{uuid.uuid4().hex}.jpg"
-        path = Path(app.config["PHOTO_DIR"]) / filename
-        path.write_bytes(content)
+        (Path(app.config["PHOTO_DIR"]) / filename).write_bytes(content)
+        created_at = datetime.now(timezone.utc).isoformat()
         db = get_db()
         with db:
             cursor = db.execute(
-                "INSERT INTO photos (subcompartment_id, filename, original_size, compressed_size, created_at) VALUES (?, ?, ?, ?, ?)",
-                (sub_id, filename, original_size, len(content), datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO photos (subcompartment_id, plot_id, filename, original_size,"
+                " compressed_size, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (sub_id, plot_id, filename, original_size, len(content), created_at),
             )
-        return jsonify({
-            "photo": {
-                "id": cursor.lastrowid,
-                "url": f"photos/{cursor.lastrowid}",
-                "original_size": original_size,
-                "compressed_size": len(content),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        }), 201
+        return jsonify({"photo": {
+            "id": cursor.lastrowid,
+            "url": f"photos/{cursor.lastrowid}",
+            "original_size": original_size,
+            "compressed_size": len(content),
+            "created_at": created_at,
+        }}), 201
 
-    @bp.get("/photos/<int:photo_id>")
-    @auth.login_required
-    def photo_file(photo_id):
-        photo = get_db().execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
-        if photo is None:
-            raise WorkbookError("照片不存在")
-        return send_file(Path(app.config["PHOTO_DIR"]) / photo["filename"], mimetype="image/jpeg")
-
-    @bp.put("/api/subcompartments/<int:sub_id>/track")
-    @auth.login_required
-    def save_track(sub_id):
-        row = get_subcompartment(sub_id)
-        if not params_of(row)["has_track"]:
-            raise WorkbookError("该项目已在「程序参数」中关闭轨迹功能")
-        payload = request.get_json(silent=True)
+    def clean_track_points(payload):
         points = payload.get("points") if isinstance(payload, dict) else None
         if not isinstance(points, list) or len(points) > 20000:
             raise WorkbookError("轨迹点格式不正确或超过 20000 点")
@@ -519,19 +653,27 @@ def create_app(prefix="", test_config=None):
                 "timestamp": timestamp,
                 "accuracy": numeric(point.get("accuracy"), f"第 {index} 个轨迹点精度"),
             })
+        return cleaned
+
+    def store_plot_track(sub_id, plot_id):
+        row = get_subcompartment(sub_id)
+        get_plot(sub_id, plot_id)
+        if not params_of(row)["has_track"]:
+            raise WorkbookError("该项目已在「程序参数」中关闭轨迹功能")
+        cleaned = clean_track_points(request.get_json(silent=True))
         db = get_db()
         with db:
             db.execute(
-                "UPDATE subcompartments SET track_json = ? WHERE id = ?",
-                (json.dumps(cleaned), sub_id),
+                "UPDATE plots SET track_json = ? WHERE id = ?",
+                (json.dumps(cleaned), plot_id),
             )
-        return jsonify({"points": cleaned, "distance": haversine_distance(cleaned)})
+        return jsonify({"plot_id": plot_id, "points": cleaned,
+                        "distance": haversine_distance(cleaned)})
 
-    @bp.get("/api/subcompartments/<int:sub_id>/track.gpx")
-    @auth.login_required
-    def export_track(sub_id):
+    def plot_gpx(sub_id, plot_id):
         row = get_subcompartment(sub_id)
-        points = json.loads(row["track_json"])
+        plot = get_plot(sub_id, plot_id)
+        points = json.loads(plot["track_json"] or "[]")
         if not points:
             raise WorkbookError("暂无轨迹可导出")
         gpx = Element("gpx", {
@@ -540,7 +682,7 @@ def create_app(prefix="", test_config=None):
         })
         trk = SubElement(gpx, "trk")
         number = json.loads(row["fields_json"]).get("number", str(sub_id))
-        SubElement(trk, "name").text = f"轨迹_{number}"
+        SubElement(trk, "name").text = f"轨迹_{number}-{plot['plot_no']}"
         segment = SubElement(trk, "trkseg")
         for point in points:
             node = SubElement(segment, "trkpt", {"lat": str(point["lat"]), "lon": str(point["lng"])})
@@ -548,8 +690,110 @@ def create_app(prefix="", test_config=None):
             SubElement(node, "time").text = taken.isoformat().replace("+00:00", "Z")
         xml = tostring(gpx, encoding="utf-8", xml_declaration=True)
         return Response(xml, mimetype="application/gpx+xml", headers={
-            "Content-Disposition": f"attachment; filename=track_{sub_id}.gpx"
+            "Content-Disposition": f"attachment; filename=track_{sub_id}_{plot_id}.gpx"
         })
+
+    @bp.post("/api/subcompartments/<int:sub_id>/plots")
+    @auth.login_required
+    def add_plot(sub_id):
+        row = get_subcompartment(sub_id)
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        plot_no = clean_plot_no(payload.get("plot_no") or next_plot_no(sub_id))
+        db = get_db()
+        try:
+            with db:
+                cursor = db.execute(
+                    "INSERT INTO plots (subcompartment_id, plot_no, created_at) VALUES (?,?,?)",
+                    (sub_id, plot_no, datetime.now(timezone.utc).isoformat()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise WorkbookError(f"该小班已有样地号「{plot_no}」，请换一个号") from exc
+        return jsonify({"plot": plot_payload(row, get_plot(sub_id, cursor.lastrowid))}), 201
+
+    @bp.patch("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>")
+    @auth.login_required
+    def rename_plot(sub_id, plot_id):
+        row = get_subcompartment(sub_id)
+        get_plot(sub_id, plot_id)
+        payload = request.get_json(silent=True) or {}
+        plot_no = clean_plot_no(payload.get("plot_no") if isinstance(payload, dict) else None)
+        db = get_db()
+        try:
+            with db:
+                db.execute("UPDATE plots SET plot_no = ? WHERE id = ?", (plot_no, plot_id))
+        except sqlite3.IntegrityError as exc:
+            raise WorkbookError(f"该小班已有样地号「{plot_no}」，请换一个号") from exc
+        return jsonify({"plot": plot_payload(row, get_plot(sub_id, plot_id))})
+
+    @bp.delete("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>")
+    @auth.login_required
+    def delete_plot(sub_id, plot_id):
+        get_subcompartment(sub_id)
+        plot = get_plot(sub_id, plot_id)
+        if len(plots_of(sub_id)) <= 1:
+            raise WorkbookError("每个小班至少要保留一个样地")
+        db = get_db()
+        photos = db.execute("SELECT filename FROM photos WHERE plot_id = ?", (plot_id,)).fetchall()
+        with db:
+            db.execute("DELETE FROM photos WHERE plot_id = ?", (plot_id,))
+            db.execute("DELETE FROM plots WHERE id = ?", (plot_id,))
+        for photo in photos:
+            (Path(app.config["PHOTO_DIR"]) / photo["filename"]).unlink(missing_ok=True)
+        remaining = plots_of(sub_id)
+        return jsonify({"ok": True, "removed": plot["plot_no"],
+                        "plots": [{"id": item["id"], "plot_no": item["plot_no"]}
+                                  for item in remaining]})
+
+    @bp.put("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>/survey")
+    @auth.login_required
+    def save_plot_survey(sub_id, plot_id):
+        return store_plot_survey(sub_id, plot_id)
+
+    @bp.post("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>/photos")
+    @auth.login_required
+    def upload_plot_photo(sub_id, plot_id):
+        return store_plot_photo(sub_id, plot_id)
+
+    @bp.put("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>/track")
+    @auth.login_required
+    def save_plot_track(sub_id, plot_id):
+        return store_plot_track(sub_id, plot_id)
+
+    @bp.get("/api/subcompartments/<int:sub_id>/plots/<int:plot_id>/track.gpx")
+    @auth.login_required
+    def export_plot_track(sub_id, plot_id):
+        return plot_gpx(sub_id, plot_id)
+
+    # 旧接口（v1.3 及以前的缓存页面）一律落在第一个样地上，不返回 404
+    @bp.put("/api/subcompartments/<int:sub_id>/survey")
+    @auth.login_required
+    def save_survey(sub_id):
+        return store_plot_survey(sub_id, first_plot(sub_id)["id"])
+
+    @bp.post("/api/subcompartments/<int:sub_id>/photos")
+    @auth.login_required
+    def upload_photo(sub_id):
+        return store_plot_photo(sub_id, first_plot(sub_id)["id"])
+
+    @bp.put("/api/subcompartments/<int:sub_id>/track")
+    @auth.login_required
+    def save_track(sub_id):
+        return store_plot_track(sub_id, first_plot(sub_id)["id"])
+
+    @bp.get("/api/subcompartments/<int:sub_id>/track.gpx")
+    @auth.login_required
+    def export_track(sub_id):
+        return plot_gpx(sub_id, first_plot(sub_id)["id"])
+
+    @bp.get("/photos/<int:photo_id>")
+    @auth.login_required
+    def photo_file(photo_id):
+        photo = get_db().execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
+        if photo is None:
+            raise WorkbookError("照片不存在")
+        return send_file(Path(app.config["PHOTO_DIR"]) / photo["filename"], mimetype="image/jpeg")
 
     # ── 管理员后台 ────────────────────────────────────────────
     def parse_upload(upload):
@@ -582,15 +826,22 @@ def create_app(prefix="", test_config=None):
                  datetime.now(timezone.utc).isoformat(), uploader,
                  json.dumps(parsed["params"], ensure_ascii=False)),
             )
-            db.executemany("""
-                INSERT INTO subcompartments
-                (project_id, source_row, data_json, fields_json, species_json)
-                VALUES (?, ?, ?, ?, ?)
-            """, [(
-                project_id, record["source_row"], json.dumps(record["data"], ensure_ascii=False),
-                json.dumps(record["fields"], ensure_ascii=False),
-                json.dumps(record["species"], ensure_ascii=False),
-            ) for record in parsed["records"]])
+            for record in parsed["records"]:
+                cursor = db.execute("""
+                    INSERT INTO subcompartments
+                    (project_id, source_row, data_json, fields_json, species_json)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    project_id, record["source_row"],
+                    json.dumps(record["data"], ensure_ascii=False),
+                    json.dumps(record["fields"], ensure_ascii=False),
+                    json.dumps(record["species"], ensure_ascii=False),
+                ))
+                # 默认给每个小班建一块「样地 1」，业务员进来就能填，不用先点新增
+                db.execute(
+                    "INSERT INTO plots (subcompartment_id, plot_no, created_at) VALUES (?,?,?)",
+                    (cursor.lastrowid, "1", datetime.now(timezone.utc).isoformat()),
+                )
         return project_id
 
     @bp.get("/admin/api/projects")

@@ -79,7 +79,25 @@ input:focus, select:focus { border-color: var(--green-2); box-shadow: 0 0 0 3px 
 .status-pill { display: inline-flex; padding: 3px 8px; border-radius: 99px; color: #66736b; background: #eef1ef; font-size: 11px; }
 .status-pill.done { color: var(--green); background: var(--green-soft); }
 .survey-heading { align-items: center; margin-bottom: 18px; }
-.plot-number { width: 180px; flex-shrink: 0; }
+/* 样地切换条：当前样地实心绿、其他灰色；一眼看出在填哪块地 */
+.plot-bar { display: flex; flex-direction: column; align-items: flex-end; flex-shrink: 0; gap: 8px; }
+.plot-bar-main { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.plot-bar-label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; }
+.plot-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.plot-chip { min-width: 40px; min-height: 34px; padding: 4px 11px; border: 1px solid #cdd8d0; border-radius: 8px; color: #7b8880; background: #f2f4f2; font-size: 13px; font-weight: 700; line-height: 1; cursor: pointer; transition: .15s; font-variant-numeric: tabular-nums; }
+.plot-chip:hover { border-color: var(--green-2); color: var(--green); }
+.plot-chip.done:not(.active) { border-color: #bcd7c4; color: var(--green); background: var(--green-soft); }
+.plot-chip.active { border-color: var(--green); color: #fff; background: var(--green); box-shadow: 0 2px 8px #24543b33; }
+.plot-chip.add { border-style: dashed; color: var(--green-2); background: #fff; }
+.plot-chip.add:hover { background: var(--green-soft); }
+.plot-add { min-height: 34px; padding: 4px 12px; border: 1px dashed #a9c3b3; border-radius: 8px; color: var(--green-2); background: #fff; font-size: 12px; font-weight: 600; cursor: pointer; }
+.plot-add:hover { border-color: var(--green-2); background: var(--green-soft); }
+.plot-bar-side { display: flex; align-items: center; gap: 10px; }
+.plot-rename { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.plot-rename input { width: 78px; min-height: 34px; margin-top: 0; padding: 4px 8px; font-size: 13px; text-align: center; }
+.plot-delete { border: 0; padding: 4px 2px; color: var(--red); background: none; font-size: 11px; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.plot-cell { white-space: nowrap; }
+.plot-cell .plot-chip { min-width: 30px; min-height: 28px; padding: 2px 8px; font-size: 12px; }
 .summary-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; margin-bottom: 16px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--line); }
 .summary-strip > div { padding: 13px 16px; background: #fff; }
 .summary-strip span, .summary-strip small { color: var(--muted); font-size: 11px; }
@@ -150,7 +168,9 @@ input:focus, select:focus { border-color: var(--green-2); box-shadow: 0 0 0 3px 
   .filter-grid label:nth-child(3), .search-field { grid-column: span 2; }
   .filter-grid .button { grid-column: span 2; }
   .filter-result span:last-child { display: none; }
-  .plot-number { width: 100%; }
+  .plot-bar { width: 100%; align-items: flex-start; }
+  .plot-bar-main { justify-content: flex-start; }
+  .plot-bar-side { width: 100%; justify-content: space-between; }
   .summary-strip { grid-template-columns: 1fr 1fr; }
   .summary-strip > div { padding: 11px 12px; }
   .summary-strip > div:last-child { grid-column: span 2; }
