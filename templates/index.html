@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#24543b">
+  <title>中幼林抚育调查</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <button id="backButton" class="icon-button hidden" type="button" aria-label="返回">←</button>
+    <div class="brand">
+      <span class="brand-mark">林</span>
+      <div><strong>中幼林抚育调查</strong><small id="pageSubtitle">调查项目</small></div>
+    </div>
+    <span class="spacer"></span>
+    <span id="saveStatus" class="save-status hidden"></span>
+  </header>
+
+  <main>
+    <section id="projectsView" class="page narrow">
+      <div class="page-heading">
+        <div><p class="eyebrow">FIELD SURVEY</p><h1>调查项目</h1><p>上传调查设计总表，开始样地调查。</p></div>
+        <span class="count-badge" id="projectCount">0 个项目</span>
+      </div>
+      <label id="uploadZone" class="upload-zone" for="projectFile">
+        <input id="projectFile" type="file" accept=".xlsx,.xlsm" hidden>
+        <span class="upload-icon">↑</span>
+        <strong>上传调查设计总表</strong>
+        <span>点击选择或拖入 Excel 文件，第一个 sheet 将作为调查基础数据</span>
+        <span class="upload-button">选择文件</span>
+      </label>
+      <div id="uploadProgress" class="progress-message hidden"></div>
+      <div class="section-heading"><h2>项目文件</h2><span>文件名即项目名称</span></div>
+      <div id="projectList" class="project-list"></div>
+    </section>
+
+    <section id="subcompartmentsView" class="page wide hidden">
+      <div class="page-heading">
+        <div><p class="eyebrow">SUBCOMPARTMENTS</p><h1 id="projectTitle"></h1><p id="projectMeta"></p></div>
+      </div>
+      <div class="filter-card">
+        <div class="filter-grid">
+          <label>标段<select id="filterSection"><option value="">全部标段</option></select></label>
+          <label>乡镇（林场）<select id="filterTownship"><option value="">全部乡镇</option></select></label>
+          <label>村委会<select id="filterVillage"><option value="">全部村委会</option></select></label>
+          <label class="search-field">小班号<input id="filterNumber" type="search" placeholder="输入小班号模糊搜索" autocomplete="off"></label>
+          <button id="resetFilters" class="button secondary" type="button">重置筛选</button>
+        </div>
+        <div class="filter-result"><span id="filterCount"></span><span>点击小班号进入样地调查</span></div>
+      </div>
+      <div class="table-card">
+        <table class="data-table">
+          <thead><tr><th>小班号</th><th>村委会</th><th>面积（亩）</th><th>树种组成</th><th>郁闭度</th><th>平均胸径</th><th>平均树高</th><th>采伐方式</th><th>调查状态</th></tr></thead>
+          <tbody id="subcompartmentRows"></tbody>
+        </table>
+        <div id="emptySubcompartments" class="empty-state hidden">没有符合当前条件的小班，请调整筛选条件。</div>
+      </div>
+    </section>
+
+    <section id="detailView" class="page survey-page hidden">
+      <div class="survey-heading">
+        <div><p class="eyebrow">PLOT SURVEY</p><h1><span id="subcompartmentTitle"></span><span class="plot-label">样地表</span></h1><p id="subcompartmentMeta"></p></div>
+        <label class="plot-number">样地号<input id="plotNumber" type="text" maxlength="50" placeholder="输入样地号"></label>
+      </div>
+
+      <div class="summary-strip">
+        <div><span>样地株数</span><strong id="summaryCount">0</strong><small>株</small></div>
+        <div><span>平均胸径</span><strong id="summaryDbh">0.0</strong><small>cm</small></div>
+        <div><span>每公顷株数</span><strong id="summaryPerHaCount">0</strong><small>株</small></div>
+        <div><span>每公顷蓄积</span><strong id="summaryPerHaVolume">0.000</strong><small>m³</small></div>
+        <div class="accent"><span>采伐株数 / 蓄积</span><strong><span id="summaryCutCount">0</span> / <span id="summaryCutVolume">0.000</span></strong><small>株 / m³</small></div>
+      </div>
+
+      <section class="survey-card">
+        <div class="card-heading">
+          <div><h2>树种组成调查</h2><p>胸径为固定径阶；树高输入米，株数为整数。修改后自动计算并保存。</p></div>
+          <div id="speciesChips" class="species-chips"></div>
+        </div>
+        <div class="survey-table-wrap">
+          <table id="surveyTable" class="survey-table"></table>
+        </div>
+        <div class="formula-note" id="formulaNote"></div>
+      </section>
+
+      <div class="tools-grid">
+        <section class="tool-card">
+          <div class="card-heading compact"><div><p class="eyebrow">FIELD PHOTOS</p><h2>样地照片</h2><p>自动等比压缩至最长边 1440px，并添加时间与定位水印。</p></div></div>
+          <input id="photoInput" type="file" accept="image/*" capture="environment" hidden>
+          <div class="button-row"><button id="takePhoto" class="button primary" type="button">拍摄 / 选择照片</button><span id="photoStatus" class="inline-status"></span></div>
+          <div id="photoList" class="photo-list"></div>
+        </section>
+
+        <section class="tool-card track-card">
+          <div class="card-heading compact"><div><p class="eyebrow">SATELLITE TRACK</p><h2>卫星轨迹</h2><p>记录 WGS-84 定位点，轨迹会保存在当前小班。</p></div><span id="trackBadge" class="track-badge">未记录</span></div>
+          <div id="trackMap" class="track-map"></div>
+          <div class="track-stats"><span>轨迹点 <strong id="trackPoints">0</strong></span><span>距离 <strong id="trackDistance">0.00</strong> km</span><span id="trackAccuracy">等待定位</span></div>
+          <div class="button-row">
+            <button id="toggleTrack" class="button primary" type="button">开始记录</button>
+            <button id="saveTrack" class="button secondary" type="button">保存轨迹</button>
+            <a id="exportTrack" class="button secondary disabled" href="#" aria-disabled="true">导出 GPX</a>
+          </div>
+          <p id="trackStatus" class="inline-status">卫星底图需要网络；浏览器定位需要授权。</p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="{{ url_for('static', filename='vendor/leaflet.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

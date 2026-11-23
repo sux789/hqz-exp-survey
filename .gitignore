@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据（上传原件、SQLite、浏览器测试产物）
+instance/
+*.db
+*.sqlite3
+.secret_key
+
+# 生成物（派生视图不入库，见 CONSTRAINTS C02/C11；需要时重新生成）
+out/
+baseline/
+.gate_state
+doc/brief.md
+doc/review.md
+doc/align.html
+doc/health/TRIAGE.md
+.DS_Store
+
+# 编辑器 / 工具
+.idea/
+.vscode/
+.workbuddy/
+node_modules/

@@ -1,0 +1,14 @@
+# BLOCKS — 积木注册表
+
+> 规则：新增积木必须登记；AI 提问 / 指令先指向编号；≤25 行。
+
+| 编号 | 职责 | 文件 | 输入 | 输出 | 依赖 |
+|---|---|---|---|---|---|
+| B1 | 工作簿表头、树种组成与样地表公式解析 | workbook.py | .xlsx/.xlsm | 基础记录与公式配置 | openpyxl |
+| B2 | 材积、汇总和轨迹距离计算 | calculations.py | 调查数据与公式配置 | 汇总结果 | B1 |
+| B3 | 项目 API、SQLite 持久化、照片和 GPX | app.py | HTTP 请求 | JSON/JPEG/GPX | B1、B2 |
+| B4 | 项目、筛选、调查网格、照片与卫星轨迹交互 | static/app.js | B3 API | 浏览器界面 | Leaflet |
+| B5 | 页面结构与移动优先样式 | `templates/index.html` `static/style.css` | B4 渲染 | 页面与布局 | — |
+| B6 | 单元测试和真实浏览器冒烟验证 | `tests/test_app.py` `tools/ui_smoke.mjs` | 真实工作簿/本地应用 | 测试断言与截图 | B1–B5 |
+
+> 契约：B1 对坏数据抛出带 Excel 行号的 WorkbookError；B2 单株和径阶材积按源表位数取整；B3 不返回服务器文件路径；B4 修改后自动保存；B6 使用隔离测试数据库与 Chrome 配置。

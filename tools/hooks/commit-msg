@@ -1,0 +1,54 @@
+#!/bin/bash
+# 提交信息闸门：让「版本 / 类型 / 文档引用」变成机器可查，而不是靠自觉。
+#
+# 安装：随 core.hooksPath=tools/hooks 生效（init.sh 已装）
+# 跳过：git commit --no-verify（同样要在迭代文档里交代）
+#
+# 规则（只约束「能不能追溯」，不约束文风）：
+#   1) 首行格式  <type>(<scope>): <摘要>   type ∈ feat|fix|docs|refactor|test|chore|perf|build|ci|revert
+#   2) 正文必须有 Refs: doc/NNN（指向本版迭代文档）
+#      纯机械改动可写 Refs: none，但必须跟一行原因，例：Refs: none（仅改拼写，无行为变化）
+#   3) Merge / Revert 提交不校验格式（由 git 生成，人没得选）
+# 为什么不用 commitlint：多一个 node 依赖 = 多一个「装不上就跑不了」的失败点，这里 40 行够用。
+set -uo pipefail
+MSG_FILE="${1:-}"
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+FIRST="$(head -n 1 "$MSG_FILE")"
+BODY="$(cat "$MSG_FILE")"
+
+case "$FIRST" in
+  Merge\ *|Revert\ *|fixup!\ *|squash!\ *) exit 0;;
+esac
+
+if ! printf '%s' "$FIRST" | grep -Eq '^(feat|fix|docs|refactor|test|chore|perf|build|ci|revert)(\([A-Za-z0-9._-]+\))?: .{2,72}$'; then
+  cat <<'EOF'
+✗ 提交信息首行不合规。需要：<type>(<scope>): <摘要>（摘要 2–72 字，单行）
+
+  示例：
+    feat(reader): 支持带逗号的 CSV 字段
+    fix(validate): 参差行改报行宽 FATAL，不再抛 IndexError
+    docs(constraints): 新增 C08 机器结果单一来源
+
+  type 取值：feat fix docs refactor test chore perf build ci revert
+EOF
+  exit 1
+fi
+
+if ! printf '%s' "$BODY" | grep -Eq 'Refs: *doc/[0-9]{3}'; then
+  if printf '%s' "$BODY" | grep -Eq 'Refs: *none'; then
+    exit 0
+  fi
+  cat <<'EOF'
+✗ 提交信息缺少迭代文档引用。正文加一行：
+
+    Refs: doc/003-AI协作v3_人机防错闭环.md
+
+  纯机械改动（拼写、格式化）可写：
+    Refs: none（仅改拼写，无行为变化）
+
+  为什么强制：没有 Refs 的提交，三个月后没人能回答「这行为什么改」（反转链断裂）。
+EOF
+  exit 1
+fi
+exit 0

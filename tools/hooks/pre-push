@@ -1,0 +1,33 @@
+#!/bin/bash
+# 推送前闸门：把「慢但必要」的验证放在离人最远的一步。
+#
+# 分工（为什么不在 pre-commit 全跑）：
+#   pre-commit = 秒级静态门（人天天过，不能烦）
+#   pre-push   = 全量业务门 + 测试（一次推送一次，等得起）
+#   无人值守   = watch / launchd（机器等，人不等人）
+#
+# 环境变量逃生：SKIP_TESTS=1 只跑闸门；SKIP_GATES=1 只跑测试（排障用，别当常态）
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+cd "$ROOT" || exit 1
+
+echo "── 推送前全量校验 ──"
+if [ "${SKIP_GATES:-0}" != "1" ]; then
+  ARGS=(--json)
+  [ -d out ] && ARGS=(--out out/ --json)
+  if ! bash tools/run.sh "${ARGS[@]}"; then
+    echo "✗ 闸门未过，禁止推送。先 bash tools/ai.sh triage 看分诊单。"
+    exit 1
+  fi
+fi
+
+if [ "${SKIP_TESTS:-0}" != "1" ] && [ -f tests/run_all.sh ]; then
+  echo "── 全量测试 tests/run_all.sh ──"
+  if ! bash tests/run_all.sh; then
+    echo "✗ 测试未过，禁止推送。"
+    exit 1
+  fi
+fi
+
+echo "✓ 可以推送"
+exit 0

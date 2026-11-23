@@ -1,0 +1,54 @@
+#!/bin/bash
+# 提交前闸门（快检）：只跑秒级检查，FAIL 即拒拦。耗时门下沉到 pre-push。
+#
+# 安装：项目根执行  git config core.hooksPath tools/hooks
+# 跳过（仅限确知安全）：git commit --no-verify —— 用了请在该版迭代文档写明原因
+#
+# 为什么只跑「秒级」：闸门一旦让人等 30 秒，人就开始 --no-verify，防线等于没有（CONSTRAINTS C10）。
+# 顺序按「最便宜的先失败」排：
+#   1) 生成物拦截（0ms，staged 列表一看就知道）
+#   2) 静态四门：索引 / 占位符 / 密钥 / 预算            —— 秒级
+#   3) staged 增量密钥补扫（双保险：将来门6 若因体积被下沉，这一步仍覆盖本次改动）
+#   4) 改了防线自身（tools/checks、hooks、run.sh）就提示跑 selftest
+# 双跑对比、全量测试、业务勾稽在 pre-push 与 CI 跑。
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+cd "$ROOT" || exit 1
+[ -f tools/run.sh ] || exit 0
+PY="${PYTHON:-python3}"
+
+STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+
+echo "── 提交前闸门（快检；完整验证见 pre-push 或 bash tools/run.sh --out out/）──"
+GEN="$(printf '%s\n' "$STAGED" | grep -E '^(doc/align\.html|doc/brief\.md|doc/review\.md|baseline/|out/|\.gate_state)' || true)"
+if [ -n "$GEN" ]; then
+  echo "✗ 生成物不得入库（改入口文件后重跑生成命令，不要 git add 生成物）："
+  printf '   %s\n' $GEN
+  echo "  见 CONSTRAINTS C02 / C11；派生视图确需留存就保持 gitignore，每次重新生成。"
+  exit 1
+fi
+
+if ! bash tools/run.sh; then
+  echo
+  echo "✗ 静态门未过，提交被拒。"
+  echo "  · 首次入库可例外：git commit --no-verify -m \"init: 模板基线\""
+  echo "  · 其他情况请修完再提交；跳过闸门须在 doc/NNN 写明原因"
+  exit 1
+fi
+
+if [ -n "$STAGED" ]; then
+  FILES=()
+  while IFS= read -r f; do [ -n "$f" ] && FILES+=("$f"); done <<< "$STAGED"
+  if ! "$PY" tools/checks/secret_scan.py . --files "${FILES[@]}"; then
+    echo "✗ 本次提交的文件里发现疑似密钥。先轮换凭证，再谈提交（见门6 说明）。"
+    exit 1
+  fi
+fi
+
+if printf '%s\n' "$STAGED" | grep -qE '^(tools/checks/|tools/hooks/|tools/(run|init|ai)\.sh$)'; then
+  echo "⚠ 本次改了防线自身 —— 提交后请立刻跑 bash tools/selftest.sh（会实例化临时项目做注入测试）"
+fi
+
+echo "✓ 快检通过"
+exit 0
