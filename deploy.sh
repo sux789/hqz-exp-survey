@@ -50,9 +50,11 @@ else
   echo "4/5 跳过依赖安装（首次部署请加 INSTALL=1）"
 fi
 
-echo "5/5 重启 gateway 并验证"
-ssh "$REMOTE" "systemctl --user restart gateway.service"
-sleep 2
+echo "5/5 优雅重载 gateway 并验证"
+# 用 HUP 让 gunicorn 重载 worker：restart 会中断所有同网关 app（既有踩坑记录）
+ssh "$REMOTE" "pid=\$(systemctl --user show -p MainPID --value gateway.service); \
+  if [ -n \"\$pid\" ] && [ \"\$pid\" != 0 ]; then kill -HUP \"\$pid\"; else systemctl --user restart gateway.service; fi"
+sleep 3
 code=$(curl -s -o /dev/null -w "%{http_code}" https://forest.bibook.top/exp-survey/)
 loc=$(curl -s -o /dev/null -w "%{redirect_url}" https://forest.bibook.top/exp-survey/)
 echo "deploy: 已同步；GET /exp-survey/ → $code ${loc:+→ $loc}"
