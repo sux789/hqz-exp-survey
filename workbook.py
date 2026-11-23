@@ -5,7 +5,16 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-from param_parser import ParamError, find_param_sheet, parse_program_params
+# gateway 共存：避免裸 import 污染公共 sys.modules["param_parser"]
+# （supervision 等同族 app 也用同名模块，谁先占位会让对方 ImportError）
+import sys as _sys
+_param_parser = _sys.modules.get("expsurvey_param_parser")
+if _param_parser is None:
+    from param_parser import ParamError, find_param_sheet, parse_program_params
+else:
+    ParamError = _param_parser.ParamError
+    find_param_sheet = _param_parser.find_param_sheet
+    parse_program_params = _param_parser.parse_program_params
 
 
 class WorkbookError(ValueError):
