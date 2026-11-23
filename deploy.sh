@@ -34,7 +34,7 @@ scp -q "$APPSPEC" "$REMOTE:$GATEWAY/apps_root/exp-survey.appspec"
 
 echo "3/5 首页 apps 表登记（幂等）"
 ssh "$REMOTE" "sqlite3 '$DB' \"INSERT OR IGNORE INTO apps(code,name,description,base_path,is_active,created_at) \
-  VALUES('exp-survey','中幼林调查','中幼林抚育样地调查','/exp-survey',1,datetime('now','localtime'))\""
+  VALUES('exp-survey','抚育调查','中幼林抚育样地调查','/exp-survey',1,datetime('now','localtime'))\""
 
 if [ "${INSTALL:-0}" = "1" ]; then
   echo "4/5 安装 Python 依赖"

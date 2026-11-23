@@ -1,5 +1,5 @@
 code: exp-survey
-name: 中幼林调查
+name: 抚育调查
 prefix: /exp-survey
 root: /home/www/bibook_deploy/apps/exp-survey
 factory: app:create_app
