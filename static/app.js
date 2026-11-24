@@ -7,7 +7,7 @@ const state = {
   filters: { section: '', township: '', village: '', number: '' },
   saveTimer: null, saveRevision: 0, saveInFlight: false, toastTimer: null,
   map: null, polyline: null, markers: [], trackPoints: [], watchId: null, recording: false,
-  lastTrackAt: 0,
+  lastTrackAt: 0, recoverTimer: null,
 };
 
 // 列表列：header 是 Excel 表头原文（用于匹配「不显示列」），label 是界面显示
@@ -377,7 +377,8 @@ function renderDetail() {
   $('#subcompartmentMeta').textContent = [fields.section, fields.township, fields.village, `小班面积 ${fields.area ?? '—'} 亩`].filter(Boolean).join(' · ');
   renderPlotBar();
   $('#plotNumber').value = plot?.plot_no || '';
-  $('#speciesChips').innerHTML = detail.species.map((item) => `<span class="species-chip">${item.coefficient}${escapeHtml(item.name)}</span>`).join('');
+  // 固定树种（参数「调查树种」）没有组成系数，只显示树种名，不显示「9云南松」这种技术写法
+  $('#speciesChips').innerHTML = detail.species.map((item) => `<span class="species-chip">${item.coefficient == null ? '' : escapeHtml(String(item.coefficient))}${escapeHtml(item.name)}</span>`).join('');
   renderSurveyTable();
   recalculateSurvey();
   renderPhotos();
@@ -759,26 +760,97 @@ function blobToBase64(blob) {
   });
 }
 
+/* ── 相机返回补存（v1.5.1，doc/011）────────────────────────────────
+   鸿蒙/EMUI 的相机是独立 Activity，内存紧张时会把承载页面的 WebView 一起回收：
+   拍完回来页面是全新加载的，takePhoto 的 Promise 连同状态栏一起消失，
+   照片只留在 App 缓存里，相册里当然找不到（现场反馈：相机开了、拍完闪回、什么都没有）。
+
+   对策：点「拍照」前把「在哪个小班/哪块样地拍的」写进 localStorage；原生侧在启动相机前
+   把原片路径写进 SharedPreferences。页面回来（或下次进 App）先问 getLastPhoto：
+   拿到原片 → 恢复路由 → 继续走压缩/水印/存相册。补存窗口 15 分钟，过期不再打扰。 */
+const PENDING_CAPTURE_KEY = 'forest_pending_capture';
+const PENDING_CAPTURE_MS = 15 * 60 * 1000;
+let captureBusy = false;
+let captureSeq = 0;          // 每次拍照 +1；补存接管后旧 Promise 回来就作废，避免同一张存两次
+let captureStartedAt = 0;    // 本次拍照开始时刻；8 秒内不做「卡住」判定
+
+function savePendingCapture(info) {
+  try { localStorage.setItem(PENDING_CAPTURE_KEY, JSON.stringify(info)); } catch (_) { /* 隐私模式写不进去就退化为不补存 */ }
+}
+
+function readPendingCapture() {
+  try { return JSON.parse(localStorage.getItem(PENDING_CAPTURE_KEY) || 'null'); } catch (_) { return null; }
+}
+
+function clearPendingCapture() {
+  try { localStorage.removeItem(PENDING_CAPTURE_KEY); } catch (_) { /* 同上 */ }
+}
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+/** 把原生侧的原片读成 File：优先走 Capacitor 本地文件服务，失败再让原生读 base64。 */
+async function photoFromPath(path, plugin) {
+  if (!path) throw new Error('相机没有返回照片');
+  let blob = null;
+  try {
+    const src = window.Capacitor.convertFileSrc ? window.Capacitor.convertFileSrc(path) : path;
+    const candidate = await (await fetch(src)).blob();
+    // 跨源拿到的可能是一页 HTML（不是图片），按内容类型判断，别把 HTML 当照片送进 Canvas
+    if (candidate.size > 0 && (!candidate.type || candidate.type.startsWith('image/'))) blob = candidate;
+  } catch (_) { /* 落到下面的原生读文件 */ }
+  if (!blob) {
+    if (!plugin || typeof plugin.readPhoto !== 'function') throw new Error('读取相机照片失败');
+    const raw = await plugin.readPhoto({ path });
+    const base64 = String((raw && raw.base64) || '');
+    if (!base64) throw new Error('相机照片为空');
+    blob = await (await fetch(`data:image/jpeg;base64,${base64}`)).blob();
+  }
+  if (!blob || !blob.size) throw new Error('相机照片为空');
+  const name = String(path).split('/').pop() || 'capture.jpg';
+  return new File([blob], name, { type: 'image/jpeg' });
+}
+
+/** 问原生要「拍了但还没存相册」的原片（页面被重载时唯一的线索）。 */
+async function lastNativePhoto(plugin) {
+  if (!plugin || typeof plugin.getLastPhoto !== 'function') return null;
+  try {
+    const shot = await plugin.getLastPhoto({ consume: false });
+    return shot && shot.path ? shot : null;
+  } catch (_) { return null; }
+}
+
+async function clearNativeMarker(plugin) {
+  if (plugin && typeof plugin.clearLastPhoto === 'function') {
+    try { await plugin.clearLastPhoto(); } catch (_) { /* 标记清理失败不影响成品 */ }
+  }
+}
+
 /** 原生相机拍一张，返回 File；没有插件时返回 null，由调用方回退到 capture 输入框。 */
 async function nativeCapture() {
   const plugin = nativePlugin();
   if (!isNativeApp() || !plugin || typeof plugin.takePhoto !== 'function') return null;
-  const shot = await plugin.takePhoto({});
-  if (!shot || !shot.path) throw new Error('相机没有返回照片');
-  let blob;
+  let shot = null;
   try {
-    const src = window.Capacitor.convertFileSrc ? window.Capacitor.convertFileSrc(shot.path) : shot.path;
-    blob = await (await fetch(src)).blob();
-  } catch (_) {
-    if (typeof plugin.readPhoto !== 'function') throw new Error('读取相机照片失败');
-    const raw = await plugin.readPhoto({ path: shot.path });   // 回退：原生读文件给 base64
-    blob = await (await fetch(`data:image/jpeg;base64,${raw.base64}`)).blob();
+    // 不设超时的话，鸿蒙上回调丢失会让按钮一直灰着、状态停在「正在打开相机…」
+    shot = await withTimeout(plugin.takePhoto({}), 150000, '相机没有返回结果');
+  } catch (error) {
+    shot = await lastNativePhoto(plugin);      // 华为常见：回 CANCELED / 回调丢失，但原片已写盘
+    if (!shot) throw error;
   }
+  if (!shot || !shot.path) throw new Error('相机没有返回照片');
+  // 先把标记清掉再读文件：标记还在 = 这次拍照的 Promise 没回来（页面重载/回调丢失），
+  // 补存流程才该接管；清早了也不会丢，路径已经在 shot.path 里。
+  await clearNativeMarker(plugin);
+  const file = await photoFromPath(shot.path, plugin);
   if (typeof plugin.removeCacheFile === 'function') {
     try { await plugin.removeCacheFile({ path: shot.path }); } catch (_) { /* 缓存清理失败不影响出图 */ }
   }
-  const name = String(shot.path).split('/').pop() || 'capture.jpg';
-  return new File([blob], name, { type: blob.type || 'image/jpeg' });
+  return file;
 }
 
 async function handlePhoto(file) {
@@ -868,20 +940,99 @@ async function startPhoto() {
   }
   const plugin = nativePlugin();
   if (isNativeApp() && plugin && typeof plugin.takePhoto === 'function') {
+    captureBusy = true;
+    // 先记下「在哪个小班/哪块样地拍的」：页面被相机顶掉后，回来只能靠这条记录对齐水印
+    savePendingCapture({
+      subId: state.detail.id,
+      plotId: state.plotId,
+      at: Date.now(),
+    });
+    const seq = ++captureSeq;
+    captureStartedAt = Date.now();
     $('#takePhoto').disabled = true;
     $('#photoStatus').textContent = '正在打开相机…';
     try {
       const file = await nativeCapture();
+      if (seq !== captureSeq) return;      // 结果已被「补存」路径接管，别再存一遍
       if (file) await handlePhoto(file);
     } catch (error) {
+      if (seq !== captureSeq) return;
       $('#photoStatus').textContent = error.message;
       toast(`相机启动失败：${error.message}`, true);
     } finally {
-      $('#takePhoto').disabled = false;
+      if (seq === captureSeq) {
+        captureBusy = false;
+        $('#takePhoto').disabled = false;
+        clearPendingCapture();
+      }
     }
     return;
   }
   $('#photoInput').click();
+}
+
+/** 页面被系统重载后回到 App：把上一次拍的原片补存进相册（15 分钟窗口内）。 */
+async function resumePendingCapture() {
+  const pending = readPendingCapture();
+  if (!pending || !isNativeApp()) return;
+  const plugin = nativePlugin();
+  if (!plugin || typeof plugin.getLastPhoto !== 'function') { clearPendingCapture(); return; }
+  if (Date.now() - (pending.at || 0) > PENDING_CAPTURE_MS) { clearPendingCapture(); return; }
+  const shot = await lastNativePhoto(plugin);
+  if (!shot) { clearPendingCapture(); return; }      // 相机里直接取消了，没留下原片
+  await finishPendingShot(shot, pending);
+}
+
+/** takePhoto 的 Promise 卡住没回来（回调丢失）时，靠「系统说文件已经落盘」把这次拍照接过来。 */
+async function adoptStuckCapture() {
+  if (!captureBusy || Date.now() - captureStartedAt < 8000) return;   // 正常流程还没结束，不抢
+  const pending = readPendingCapture();
+  if (!pending) return;
+  const plugin = nativePlugin();
+  const shot = await lastNativePhoto(plugin);
+  if (!shot) return;                                  // 人还在相机里，不用管
+  captureSeq += 1;                                    // 作废卡住的那次调用
+  await finishPendingShot(shot, pending);
+}
+
+/** 补存主流程：恢复路由 → 读原片 → 压缩/水印 → 存相册。两条入口（重载/卡死）共用。 */
+async function finishPendingShot(shot, pending) {
+  const plugin = nativePlugin();
+  clearPendingCapture();
+  await clearNativeMarker(plugin);       // 先删标记：后续任何一次补存探测都不会再捡到这张
+  captureBusy = true;
+  $('#takePhoto').disabled = true;
+  $('#photoStatus').textContent = '正在补存刚才拍的相片…';
+  try {
+    if (!state.detail || state.detail.id !== pending.subId || state.plotId !== pending.plotId) {
+      location.hash = `#/sub/${pending.subId}/${pending.plotId}`;   // 重载后 hash 丢失，先回原样地
+      const ready = await waitForDetail(pending.subId, 5000);
+      if (!ready) throw new Error('没能回到原样地，请手动进入该样地后重拍');
+    }
+    const file = await photoFromPath(shot.path, plugin);
+    await handlePhoto(file);
+    await clearNativeMarker(plugin);
+    if (plugin && typeof plugin.removeCacheFile === 'function') {
+      try { await plugin.removeCacheFile({ path: shot.path }); } catch (_) { /* 同上 */ }
+    }
+  } catch (error) {
+    $('#photoStatus').textContent = error.message;
+    toast(`补存相册失败：${error.message}`, true);
+  } finally {
+    captureBusy = false;
+    $('#takePhoto').disabled = false;
+  }
+}
+
+/** 等详情页加载到指定小班（重载后要等 API 回来才能命水印、目录）。 */
+function waitForDetail(subId, timeout) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (state.detail && state.detail.id === subId) { clearInterval(timer); resolve(true); return; }
+      if (Date.now() - started > timeout) { clearInterval(timer); resolve(false); }
+    }, 120);
+  });
 }
 
 function trackCacheKey() {
@@ -1085,6 +1236,16 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden && state.detail && !$('#detailView').classList.contains('hidden')) {
     if (state.saveTimer) saveSurvey();
     if (state.trackPoints.length) saveTrack(false);
+    return;
+  }
+  if (!document.hidden) {
+    setTimeout(resumePendingCapture, 400);   // 从相机回来：页面被重载过
+    setTimeout(adoptStuckCapture, 2600);     // 从相机回来：页面没重载但回调丢了
+    clearInterval(state.recoverTimer);
+    state.recoverTimer = setInterval(() => {
+      if (document.hidden || !captureBusy) { clearInterval(state.recoverTimer); state.recoverTimer = null; return; }
+      adoptStuckCapture();
+    }, 5000);
   }
 });
 
@@ -1111,6 +1272,7 @@ async function bootstrap() {
     hideLogin();
     updateTopbar();
     await handleRoute();
+    setTimeout(resumePendingCapture, 600);   // 上次被相机顶掉、今天重新进 App 时补存
   } catch (error) {
     toast(error.message, true);
     showLogin();

@@ -44,6 +44,7 @@ default_params = _pp.default_params
 public_params = _pp.public_params
 WorkbookError = _workbook.WorkbookError
 parse_workbook = _workbook.parse_workbook
+survey_species = _workbook.survey_species
 build_project_workbook = _export.build_project_workbook
 
 # gateway 约定：create_app(prefix='/exp-survey')，DispatcherMiddleware 已剥前缀并设 SCRIPT_NAME，
@@ -103,7 +104,7 @@ MIGRATIONS = (
 # 静态资源版本：每次发版递增，模板把它拼到 ?v= 上。
 # 原因：Capacitor WebView 会把 app.js 缓存到本地，HTML 改了但 JS 还是旧的 →
 # 旧页面继续 POST 已删除的 /api/login，拿到 404 HTML 就报 "is not valid JSON"。
-ASSET_VERSION = "v1.5.0"
+ASSET_VERSION = "v1.6"
 
 
 def parse_blob(filename, blob):
@@ -328,7 +329,7 @@ def create_app(prefix="", test_config=None):
 
     def sub_detail(row):
         schema = json.loads(row["schema_json"])
-        species = json.loads(row["species_json"])
+        species = survey_species(json.loads(row["species_json"]), params_of(row))
         visible = [item["name"] for item in species]
         plots = [plot_json(plot, schema, visible) for plot in plots_of(row["id"])]
         first = plots[0]
@@ -468,9 +469,10 @@ def create_app(prefix="", test_config=None):
         """, (project_id,)).fetchall():
             by_sub.setdefault(plot["subcompartment_id"], []).append(plot)
         sheets = []
+        project_params = params_of(project)
         for row in rows:
             fields = json.loads(row["fields_json"])
-            species = json.loads(row["species_json"])
+            species = survey_species(json.loads(row["species_json"]), project_params)
             for plot in by_sub.get(row["id"], []):
                 sheets.append({
                     "source_row": row["source_row"],
@@ -551,20 +553,22 @@ def create_app(prefix="", test_config=None):
 
     def plot_payload(row, plot_row):
         schema = json.loads(row["schema_json"])
-        visible = [item["name"] for item in json.loads(row["species_json"])]
+        visible = [item["name"]
+                   for item in survey_species(json.loads(row["species_json"]), params_of(row))]
         return plot_json(plot_row, schema, visible)
 
     def clean_survey(payload, row):
         if not isinstance(payload, dict):
             raise WorkbookError("调查数据格式不正确")
         schema = json.loads(row["schema_json"])
-        visible = [item["name"] for item in json.loads(row["species_json"])]
+        visible = [item["name"]
+                   for item in survey_species(json.loads(row["species_json"]), params_of(row))]
         raw_trees = payload.get("trees", {})
         raw_cut = payload.get("cut", {})
         if not isinstance(raw_trees, dict) or not isinstance(raw_cut, dict):
             raise WorkbookError("调查数据格式不正确")
         if set(raw_trees) - set(visible):
-            raise WorkbookError("调查数据包含不属于该小班树种组成的树种")
+            raise WorkbookError("调查数据包含不在本小班调查树种里的树种")
         diameters = {str(value) for value in schema["diameters"]}
         trees = {}
         for name in visible:

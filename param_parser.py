@@ -57,9 +57,15 @@ KEYS = {
                  "JPEG 质量 0.3-1.0，越小文件越小"),
     "不显示列": ("列表", None, "",
                  "小班列表要隐藏的列名，必须是基础数据表头"),
+    "调查树种": ("树种", None, "",
+                 "调查页固定显示的树种；留空按「树种组成」拆分。多个用空格或顿号隔开"),
     "轨迹采样间隔": ("数值", (1, 60), 5,
                      "记录轨迹时取点间隔（秒），越大越省电"),
 }
+
+# 「调查树种」是给外业非技术人员的，分隔符按人怎么写都认：空格、顿号、逗号、分号、斜杠。
+# 其余列表型 key 仍走 _split（只认半角分号，全角报错），避免一个宽松口径扩散到全表。
+SPECIES_SPLIT = re.compile(r"[\s、,，;；/／|｜]+")
 
 DEFAULT_SOURCE = ""
 
@@ -200,10 +206,41 @@ def _list_items(key, value, row_no, headers):
     return items
 
 
-def parse_program_params(wb, base_headers):
+def _species_items(key, value, row_no, choices=None):
+    """「调查树种」取值：允许空格 / 顿号 / 逗号 / 分号 / 斜杠混用，重复与未知树种当场报错。
+
+    为什么这里放宽分隔符而不沿用 _split：写这张表的是外业技术员，不是程序员。
+    「云南松 油杉 其他阔叶 栎类」这种空格写法最自然，报「全角分隔符」只会让人放弃配置。
+    但**不能放宽到自动纠错**：树种名与样地表对不上时按 C13 原样报错，绝不猜近似名。
+    """
+    text = _text(value)
+    if not text:
+        return []  # 留空 = 不固定，回到「按树种组成拆分」
+    items = [item for item in SPECIES_SPLIT.split(text) if item]
+    seen, duplicated = set(), []
+    for item in items:
+        if item in seen and item not in duplicated:
+            duplicated.append(item)
+        seen.add(item)
+    if duplicated:
+        raise ParamError(
+            f"程序参数第{row_no}行 key「{key}」：树种重复 {('、'.join(duplicated))}；每个树种只写一次"
+        )
+    if choices is not None:
+        unknown = [item for item in items if item not in choices]
+        if unknown:
+            raise ParamError(
+                f"程序参数第{row_no}行 key「{key}」：{('、'.join(unknown))} 在样地表里没有材积公式；"
+                f"样地表现有树种：{'、'.join(choices)}"
+            )
+    return items
+
+
+def parse_program_params(wb, base_headers, species_choices=None):
     """解析参数表。
 
-    wb: openpyxl Workbook；base_headers: 第一个 sheet 的表头列名（用于校验「不显示列」）。
+    wb: openpyxl Workbook；base_headers: 第一个 sheet 的表头列名（用于校验「不显示列」）；
+    species_choices: 样地表里带材积公式的树种（用于校验「调查树种」，None 表示不校验）。
     返回 dict；无参数表时返回默认值（source_sheet 为空串）。
 
     分两遍：「功能」先落地，再按「轨迹是否开启」决定「轨迹采样间隔」是否要校验。
@@ -263,6 +300,9 @@ def parse_program_params(wb, base_headers):
         if key == "功能":
             continue
         kind, allowed, _default, _desc = KEYS[key]
+        if kind == "树种":
+            values[key] = _species_items(key, value, row_no, species_choices)
+            continue
         if kind == "列表":
             values[key] = _list_items(key, value, row_no, headers)
             continue
@@ -293,7 +333,12 @@ def default_params():
     """
     params = {}
     for key, (kind, _allowed, default, _desc) in KEYS.items():
-        params[key] = _split(default, 0, key) if kind == "列表" else default
+        if kind == "列表":
+            params[key] = _split(default, 0, key)
+        elif kind == "树种":
+            params[key] = [] if not _text(default) else _species_items(key, default, 0)
+        else:
+            params[key] = default
     params["source_sheet"] = DEFAULT_SOURCE
     return params
 

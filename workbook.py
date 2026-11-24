@@ -263,6 +263,19 @@ def parse_plot_schema(wb):
     }
 
 
+def survey_species(record_species, params):
+    """调查页要显示的树种：参数「调查树种」非空就固定用它，否则按树种组成拆分。
+
+    「不按树种组成拆分」的场景（同一小班混交、组成写不准、外业只按四大类点数）由参数兜底，
+    而不是改数据：组成原文仍留在 fields.composition，导出/列表照旧可追溯。
+    固定树种没有组成系数，coefficient 置 None —— 界面只显示树种名，不给外业看「9云南松」。
+    """
+    fixed = (params or {}).get("调查树种") or []
+    if not fixed:
+        return record_species
+    return [{"name": name, "coefficient": None} for name in fixed]
+
+
 def parse_workbook(path):
     path = Path(path)
     try:
@@ -280,7 +293,7 @@ def parse_workbook(path):
     records, fields, headers = parse_base_rows(first)
     schema = parse_plot_schema(wb)
     try:
-        params = parse_program_params(wb, headers)
+        params = parse_program_params(wb, headers, species_choices=list(schema["species"]))
     except ParamError as exc:
         raise WorkbookError(str(exc)) from exc
     available = set(schema["species"])

@@ -13,7 +13,7 @@ from app import ASSET_VERSION, create_app
 from calculations import calculate_summary, unit_volume
 from export_xlsx import build_project_workbook
 from param_parser import public_params
-from workbook import WorkbookError, parse_workbook
+from workbook import WorkbookError, parse_workbook, survey_species
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,6 +171,57 @@ class WorkbookTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp:
                     path = Path(temp) / "坏参数.xlsx"
                     path.write_bytes(workbook_with_params(rows))
+                    with self.assertRaises(WorkbookError) as ctx:
+                        parse_workbook(path)
+                self.assertIn(expected, str(ctx.exception))
+                self.assertIn("第2行", str(ctx.exception))
+
+    def test_param_sheet_fixed_survey_species_skips_composition(self):
+        """v1.6：参数「调查树种」非空 → 调查页固定这几种，不再按树种组成拆分。
+
+        现场口径：混交小班的组成写不准，外业只按四大类点数；固定树种写进配置而不是改数据，
+        fields.composition 原文照旧保留，导出/列表仍可追溯。
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "树种参数.xlsx"
+            path.write_bytes(workbook_with_params([
+                ["调查树种", "云南松  油杉  其他阔叶  栎类", "树种", "空",
+                 "空格/顿号分隔", "云南松 油杉"],
+            ]))
+            parsed = parse_workbook(path)
+        self.assertEqual(parsed["params"]["调查树种"], ["云南松", "油杉", "其他阔叶", "栎类"])
+        # 组成原文仍按「系数+名称」解析（数据不变），只是调查页不用它
+        self.assertEqual([item["name"] for item in parsed["records"][0]["species"]],
+                         ["云南松", "其他阔叶"])
+        fixed = survey_species(parsed["records"][0]["species"], parsed["params"])
+        self.assertEqual([item["name"] for item in fixed], ["云南松", "油杉", "其他阔叶", "栎类"])
+        self.assertTrue(all(item["coefficient"] is None for item in fixed))
+
+    def test_fixed_survey_species_accepts_plain_separators(self):
+        """非技术人员怎么写都认：顿号、逗号、分号、斜杠混用同一个结果。"""
+        cases = ["云南松、油杉、其他阔叶、栎类",
+                 "云南松,油杉，其他阔叶;栎类",
+                 "云南松/油杉 其他阔叶|栎类"]
+        for text in cases:
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "分隔符.xlsx"
+                    path.write_bytes(workbook_with_params([
+                        ["调查树种", text, "树种", "", "", ""],
+                    ]))
+                    params = parse_workbook(path)["params"]
+                self.assertEqual(params["调查树种"], ["云南松", "油杉", "其他阔叶", "栎类"])
+
+    def test_fixed_survey_species_rejects_unknown_and_duplicate(self):
+        """树种名对不上样地表就原样报错（C13），不猜近似名；重复当场拒收。"""
+        cases = [("云南松 桦木", "样地表现有树种"), ("云南松 云南松", "树种重复")]
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "坏树种参数.xlsx"
+                    path.write_bytes(workbook_with_params([
+                        ["调查树种", text, "树种", "", "", ""],
+                    ]))
                     with self.assertRaises(WorkbookError) as ctx:
                         parse_workbook(path)
                 self.assertIn(expected, str(ctx.exception))
@@ -356,6 +407,36 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(detail["schema"]["diameters"][0], 6)
         self.assertTrue(detail["params"]["has_photo"])
         self.assertFalse(detail["params"]["has_track"])     # 默认不带轨迹
+
+    def test_fixed_species_param_drives_survey_table(self):
+        """参数固定 4 个树种：详情页列、保存校验、导出三处口径必须一致。"""
+        project = self.upload("固定树种.xlsx", workbook_with_params([
+            ["调查树种", "云南松 油杉 其他阔叶 栎类", "树种", "", "四大类", ""],
+        ]))
+        detail = self.client.get(f"/api/projects/{project['id']}").get_json()
+        sub_id = detail["subcompartments"][0]["id"]
+        sub = self.client.get(f"/api/subcompartments/{sub_id}").get_json()
+        self.assertEqual([item["name"] for item in sub["species"]],
+                         ["云南松", "油杉", "其他阔叶", "栎类"])
+        self.assertIsNone(sub["species"][0]["coefficient"])
+
+        # 该小班组成是「9云南松1其他阔叶」，固定模式下仍可填油杉/栎类
+        response = self.client.put(f"/api/subcompartments/{sub_id}/survey", json={
+            "trees": {"云南松": {"6": {"height": 8, "count": 1}},
+                      "油杉": {"6": {"height": 9, "count": 2}}},
+            "cut": {},
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        summary = response.get_json()["summary"]
+        self.assertEqual(set(summary["species"]), {"云南松", "油杉", "其他阔叶", "栎类"})
+
+        export = self.client.get(f"/api/projects/{project['id']}/export.xlsx")
+        self.assertEqual(export.status_code, 200)
+        wb = load_workbook(io.BytesIO(export.data))
+        values = {cell.value for row in wb.worksheets[0].iter_rows() for cell in row}
+        # 导出明细的「树种」列：油杉不在该小班的树种组成里，能出现就证明固定树种生效了
+        self.assertIn("油杉", values)
+        self.assertIn("云南松", values)
 
     def test_survey_autosave_calculates_and_rejects_invalid_counts(self):
         sub_id = self.first_sub()

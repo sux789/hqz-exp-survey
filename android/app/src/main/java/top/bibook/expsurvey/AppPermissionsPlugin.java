@@ -3,7 +3,9 @@ package top.bibook.expsurvey;
 import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -41,10 +43,16 @@ import java.io.OutputStream;
  *   - savePhoto({base64,name,subdir})  压缩+水印后的成品写入系统相册 Pictures/{subdir}/，
  *                                   返回真实绝对路径；subdir 支持多级（如 2025年度/XP-01）
  *   - removeCacheFile({path})       删掉拍照缓存的原片（成品已落相册，原片没有保留价值）
+ *   - getLastPhoto({consume})       取「拍完但没存进相册」的原片（页面被系统重载后补存，见 doc/011）
+ *   - clearLastPhoto()              丢掉待补存标记（正常流程存相册成功后调用）
  *   - check({type}) / request({type}) / openSettings()   相机权限查询与申请
  *
  * 为什么自己做相机：WebView 的 <input capture> 在部分机型/系统上仍会弹出「相机还是相册」，
  * 而外业要求照片只能现拍、不能从相册挑旧图。
+ *
+ * 两处机型差异必须按「文件真的有内容」判断，不能只看 resultCode：
+ *   · 华为/鸿蒙部分机型拍完写盘成功却回 RESULT_CANCELED；
+ *   · 相机 Activity 常把 WebView 顶掉，页面回来是全新加载，回调里的 call 为 null。
  *
  * 写入相册走 MediaStore（Android 10+ 自有媒体免存储权限，相册立即可见，多级目录自动创建）；
  * 旧版本回退应用外部私有目录（不需要 WRITE_EXTERNAL_STORAGE）。
@@ -57,7 +65,13 @@ import java.io.OutputStream;
 )
 public class AppPermissionsPlugin extends Plugin {
 
-    /** 相机 Activity 是异步返回的，路径先存字段；进程被回收时回调里 call 为 null，直接放弃。 */
+    /** 待补存原片：路径写 SharedPreferences，插件实例被系统回收后仍能捞回（鸿蒙实测会回收）。 */
+    private static final String PREFS = "exp_photo_pending";
+    private static final String KEY_PENDING_PATH = "path";
+    private static final String KEY_PENDING_AT = "at";
+    private static final long RECOVER_WINDOW_MS = 15 * 60 * 1000L;
+
+    /** 相机 Activity 是异步返回的，路径先存字段；进程被回收时回调里 call 为 null。 */
     private String pendingPhotoPath;
 
     @PluginMethod
@@ -128,6 +142,14 @@ public class AppPermissionsPlugin extends Plugin {
             }
             File target = new File(dir, "cap_" + System.currentTimeMillis() + ".jpg");
             pendingPhotoPath = target.getAbsolutePath();
+            // 关键：**启动相机前**就把路径写进 SharedPreferences。
+            // 鸿蒙/EMUI 上相机是独立 Activity，内存紧张时会把 WebView 连同本插件实例一起回收，
+            // 页面回来是全新加载的 —— 那时 cameraResult 里的 call 为 null，原片路径只剩这份落盘记录。
+            // 页面通过 getLastPhoto 把它捞回来继续压缩、加水印、存相册。
+            getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                    .putString(KEY_PENDING_PATH, pendingPhotoPath)
+                    .putLong(KEY_PENDING_AT, System.currentTimeMillis())
+                    .apply();
             Uri uri = FileProvider.getUriForFile(
                     getContext(), getContext().getPackageName() + ".fileprovider", target);
             Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
@@ -136,30 +158,85 @@ public class AppPermissionsPlugin extends Plugin {
             startActivityForResult(call, intent, "cameraResult");
         } catch (Exception e) {
             pendingPhotoPath = null;
+            clearPending();
             call.reject("无法启动相机: " + e.getMessage(), e);
         }
     }
 
     @ActivityCallback
     private void cameraResult(PluginCall call, ActivityResult result) {
-        if (call == null) {              // 系统回收过 WebView，页面已重建，没有可回话的对象
-            pendingPhotoPath = null;
-            return;
-        }
         String path = pendingPhotoPath;
+        if (path == null) {
+            path = pendingPathFromPrefs();          // 插件实例被重建时只能靠落盘记录
+        }
         pendingPhotoPath = null;
-        if (result == null || result.getResultCode() != Activity.RESULT_OK) {
-            deleteQuietly(path);
-            call.reject("已取消拍照");
+        File file = path == null ? null : new File(path);
+        boolean hasPhoto = file != null && file.exists() && file.length() > 0;
+        boolean okResult = result != null && result.getResultCode() == Activity.RESULT_OK;
+
+        if (call == null) {
+            // WebView 已重建：页面会在恢复时用 getLastPhoto 接管，这里只保留已经落盘的原片
+            if (!hasPhoto) clearPending();
             return;
         }
-        if (path == null || !new File(path).exists()) {
-            call.reject("相机没有生成照片");
+        // 华为/鸿蒙实测：部分机型明明已写盘却回 RESULT_CANCELED。
+        // 判据以「文件真的有内容」为准，resultCode 只作参考，否则会把拍好的照片误删。
+        if (!hasPhoto) {
+            clearPending();
+            if (okResult) {
+                call.reject("相机没有生成照片");
+            } else {
+                call.reject("已取消拍照");
+            }
             return;
         }
+        call.resolve(resultOf(path));
+    }
+
+    /**
+     * 取「上一次拍照留下但还没存进相册」的原片（页面被系统重载后补存用）。
+     * consume=true 时读完即清标记，避免重复入库；文件不存在/为空/超过 15 分钟视为没有。
+     */
+    @PluginMethod
+    public void getLastPhoto(PluginCall call) {
+        boolean consume = call.getBoolean("consume", Boolean.TRUE);
+        String path = pendingPathFromPrefs();
+        long at = getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getLong(KEY_PENDING_AT, 0L);
+        JSObject ret = new JSObject();
+        if (path != null) {
+            File file = new File(path);
+            long age = System.currentTimeMillis() - at;
+            if (file.exists() && file.length() > 0 && age <= RECOVER_WINDOW_MS) {
+                ret.put("path", path);
+                ret.put("takenAt", at);
+            }
+        }
+        if (consume) clearPending();
+        call.resolve(ret);
+    }
+
+    /** 明确丢掉待补存标记（正常流程存相册成功后调用）。 */
+    @PluginMethod
+    public void clearLastPhoto(PluginCall call) {
+        clearPending();
+        call.resolve();
+    }
+
+    private String pendingPathFromPrefs() {
+        return getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_PENDING_PATH, null);
+    }
+
+    private void clearPending() {
+        getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove(KEY_PENDING_PATH).remove(KEY_PENDING_AT).apply();
+    }
+
+    private JSObject resultOf(String path) {
         JSObject ret = new JSObject();
         ret.put("path", path);
-        call.resolve(ret);
+        return ret;
     }
 
     /* ── 相册写入 ────────────────────────────────────────────────── */
